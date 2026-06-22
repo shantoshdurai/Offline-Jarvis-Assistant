@@ -1,0 +1,13 @@
+faster-whisper
+openwakeword
+edge-tts
+pygame
+sounddevice
+soundfile
+numpy
+scipy
+huggingface_hub
+llama-cpp-python --extra-index-url https://abetlen.github.io/llama-cpp-python/whl/cpu --only-binary llama-cpp-python
+pyaudio
+pystray
+pillow

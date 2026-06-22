@@ -1,0 +1,17 @@
+venv/
+__pycache__/
+*.pyc
+
+# PyInstaller folders
+build/
+dist/
+*.spec
+
+# Local Models and Audio Files
+models/
+*.wav
+*.mp3
+
+# Editor folders
+.vscode/
+.idea/
