@@ -4,6 +4,8 @@ import subprocess
 import webbrowser
 import shutil
 import urllib.parse
+import urllib.request
+import json
 from datetime import datetime
 import re
 import ast
@@ -60,25 +62,132 @@ def open_url(url_or_target, browser=None):
     webbrowser.open(url)
     return f"Opened {url} in your default browser."
 
-def open_leetcode(problem_query=""):
-    """Opens a specific LeetCode problem or the daily problem set."""
-    clean = (problem_query or "").strip().strip("'\"").lower()
-    # Clean unwanted filler words
-    clean = re.sub(r'\b(with\s+today|today|daily|problem|problems|website|solution|in|firefox|chrome|browser|please|with)\b', '', clean).strip()
-    
-    if not clean or len(clean) < 2 or clean in ["all", "list", "set", "challenge"]:
-        url = "https://leetcode.com/problemset/"
-        webbrowser.open(url)
-        return f"Opened LeetCode problem set in browser ({url})."
+def get_leetcode_daily():
+    """Queries LeetCode public GraphQL API for today's active coding challenge."""
+    url = "https://leetcode.com/graphql"
+    query = """
+    query questionOfToday {
+        activeDailyCodingChallengeQuestion {
+            date
+            link
+            question {
+                questionFrontendId
+                title
+                titleSlug
+            }
+        }
+    }
+    """
+    body = json.dumps({"query": query}).encode("utf-8")
+    headers = {
+        "Content-Type": "application/json",
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)"
+    }
+    req = urllib.request.Request(url, data=body, headers=headers)
+    try:
+        with urllib.request.urlopen(req, timeout=4) as response:
+            data = json.loads(response.read().decode())
+            daily = data.get("data", {}).get("activeDailyCodingChallengeQuestion", {})
+            q = daily.get("question", {})
+            title = q.get("title")
+            slug = q.get("titleSlug")
+            return title, slug
+    except Exception:
+        return None, None
 
-    slug = clean.replace(" ", "-").replace("_", "-")
-    if "-" in slug and slug.split("-")[0].isdigit():
-        slug = "-".join(slug.split("-")[1:])
-    slug = slug.strip("-")
-    
-    url = f"https://leetcode.com/problems/{slug}/"
-    webbrowser.open(url)
-    return f"Opened LeetCode problem '{problem_query}' in browser ({url})."
+def check_leetcode_problem(slug):
+    """Verifies whether a problem slug exists on LeetCode via GraphQL."""
+    if not slug:
+        return None
+    url = "https://leetcode.com/graphql"
+    query = """
+    query questionTitle($titleSlug: String!) {
+        question(titleSlug: $titleSlug) {
+            questionFrontendId
+            title
+            titleSlug
+        }
+    }
+    """
+    body = json.dumps({
+        "query": query,
+        "variables": {"titleSlug": slug}
+    }).encode("utf-8")
+    headers = {
+        "Content-Type": "application/json",
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)"
+    }
+    req = urllib.request.Request(url, data=body, headers=headers)
+    try:
+        with urllib.request.urlopen(req, timeout=4) as response:
+            data = json.loads(response.read().decode())
+            return data.get("data", {}).get("question")
+    except Exception:
+        return None
+
+def open_leetcode(problem_query="", browser=None):
+    """
+    Intelligently opens a LeetCode problem, today's daily challenge,
+    or falls back frankly to problem search if the exact link is uncertain.
+    Returns (action_msg, speech_response).
+    """
+    t = (problem_query or "").strip().strip("'\"").lower()
+
+    # 1. Daily Challenge Request
+    if any(w in t for w in ["today", "daily", "challenge of today", "today's"]):
+        title, slug = get_leetcode_daily()
+        if slug and title:
+            url = f"https://leetcode.com/problems/{slug}/"
+            open_url(url, browser=browser)
+            action = f"Opened today's LeetCode daily challenge: '{title}' ({url})"
+            speech = f"I fetched today's LeetCode daily challenge for you: {title}. Opening it now in your browser."
+            return action, speech
+        else:
+            url = "https://leetcode.com/problemset/"
+            open_url(url, browser=browser)
+            action = f"Opened LeetCode problem set ({url})"
+            speech = "I opened the LeetCode problem set for you. I couldn't reach the daily challenge server right now, but today's problem is pinned at the top."
+            return action, speech
+
+    # Clean query of filler words
+    clean = re.sub(r'^(hey\s+jarvis\s*,?\s*|jarvis\s*,?\s*)', '', t)
+    clean = re.sub(r'^(can\s+you\s+)?(open|show|go\s+to|launch|give\s+me)\s+(leetcode\s+)?(problem\s+|question\s+)?', '', clean).strip()
+    clean = re.sub(r'\b(on\s+leetcode|in\s+leetcode|from\s+leetcode|leetcode)\b', '', clean).strip()
+    clean = re.sub(r'\b(in\s+my\s+browser|in\s+browser|in\s+firefox|in\s+chrome|please|for\s+me|website|solution)\b', '', clean).strip()
+    clean = re.sub(r'^(for|about|with|the)\s+', '', clean).strip()
+    clean = clean.strip('\'".,?! ')
+
+    # 2. General / Empty -> open Problemset homepage
+    if not clean or clean in ["all", "list", "set", "problemset", "problems", "home", "homepage"]:
+        url = "https://leetcode.com/problemset/"
+        open_url(url, browser=browser)
+        action = f"Opened LeetCode problem set ({url})"
+        speech = "Opening the LeetCode problem set homepage in your browser."
+        return action, speech
+
+    # 3. Form candidate slug
+    candidate_slug = re.sub(r'[^a-zA-Z0-9\s-]', '', clean).strip().replace(" ", "-").replace("_", "-")
+    candidate_slug = re.sub(r'-+', '-', candidate_slug).lower()
+    if "-" in candidate_slug and candidate_slug.split("-")[0].isdigit():
+        candidate_slug = "-".join(candidate_slug.split("-")[1:])
+
+    prob_info = check_leetcode_problem(candidate_slug) if candidate_slug else None
+    if prob_info and prob_info.get("titleSlug"):
+        title = prob_info.get("title")
+        slug = prob_info.get("titleSlug")
+        num = prob_info.get("questionFrontendId", "")
+        url = f"https://leetcode.com/problems/{slug}/"
+        open_url(url, browser=browser)
+        action = f"Opened LeetCode problem '{title}' (#{num}) ({url})"
+        speech = f"Opening LeetCode problem {title} in your browser."
+        return action, speech
+    else:
+        # Frank fallback: do not guess a link that might 404! Open search and tell user frankly.
+        search_url = f"https://leetcode.com/problemset/?search={urllib.parse.quote(clean)}"
+        open_url(search_url, browser=browser)
+        action = f"Opened LeetCode search for '{clean}' ({search_url})"
+        speech = f"I opened the LeetCode search for {clean}. To be frank, I wasn't completely sure of the direct link, so I opened the search results so you can select the exact problem."
+        return action, speech
 
 def open_app(app_name):
     """Opens local applications (Firefox, VS Code, Notepad, Terminal, Explorer, etc.)"""
@@ -333,30 +442,117 @@ def execute_command(command):
     except Exception as e:
         return f"Error executing command: {e}"
 
+def list_folder_contents(folder_name="", max_items=15):
+    """Lists files and folders inside common directories or a specified directory."""
+    raw = (folder_name or "").strip().strip("'\"").lower()
+    user_home = os.path.expanduser("~")
+    
+    if "download" in raw:
+        target_dir = os.path.join(user_home, "Downloads")
+        display_name = "Downloads"
+    elif "desktop" in raw:
+        target_dir = os.path.join(user_home, "Desktop")
+        display_name = "Desktop"
+    elif "document" in raw:
+        target_dir = os.path.join(user_home, "Documents")
+        display_name = "Documents"
+    elif "picture" in raw or "photo" in raw:
+        target_dir = os.path.join(user_home, "Pictures")
+        display_name = "Pictures"
+    elif "project" in raw or "code" in raw or "repo" in raw:
+        target_dir = os.getcwd()
+        display_name = "Current Project"
+    elif folder_name and os.path.exists(os.path.expanduser(folder_name.strip("'\""))):
+        target_dir = os.path.expanduser(folder_name.strip("'\""))
+        display_name = target_dir
+    else:
+        target_dir = os.path.join(user_home, "Downloads")
+        display_name = "Downloads"
+
+    if not os.path.exists(target_dir):
+        return f"Directory does not exist: {target_dir}"
+
+    try:
+        entries = []
+        for item in os.listdir(target_dir):
+            if item.startswith(".") or item.startswith("$"):
+                continue
+            full_path = os.path.join(target_dir, item)
+            is_dir = os.path.isdir(full_path)
+            try:
+                mtime = os.path.getmtime(full_path)
+                size_mb = os.path.getsize(full_path) / (1024 * 1024) if not is_dir else 0
+                entries.append((item, is_dir, mtime, size_mb))
+            except Exception:
+                entries.append((item, is_dir, 0, 0))
+
+        # Sort by modification time descending (most recent first)
+        entries.sort(key=lambda x: x[2], reverse=True)
+        
+        lines = [f"Contents of {display_name} ({len(entries)} items total):"]
+        for name, is_dir, mtime, size_mb in entries[:max_items]:
+            kind = "[DIR] " if is_dir else "      "
+            size_str = f"({size_mb:.1f} MB)" if not is_dir and size_mb >= 0.1 else ""
+            lines.append(f"  {kind}{name} {size_str}".rstrip())
+            
+        if len(entries) > max_items:
+            lines.append(f"  ... and {len(entries) - max_items} more items")
+            
+        return "\n".join(lines)
+    except Exception as e:
+        return f"Error reading folder {target_dir}: {e}"
+
 def search_local_files(query, directory=None):
-    """Searches for files matching query in a directory."""
-    base_dir = os.path.expanduser(directory.strip().strip("'\"")) if directory else os.path.expanduser("~")
+    """Searches for files matching query in local user and project directories."""
+    q = query.strip().strip("'\"").lower()
+    user_home = os.path.expanduser("~")
+    
+    if directory:
+        search_dirs = [os.path.expanduser(directory.strip().strip("'\""))]
+    else:
+        # Check high-value user directories first for near-instant results
+        search_dirs = [
+            os.getcwd(),
+            os.path.join(user_home, "Downloads"),
+            os.path.join(user_home, "Desktop"),
+            os.path.join(user_home, "Documents"),
+            os.path.join(user_home, "Pictures")
+        ]
+
     matches = []
-    q = query.lower()
-    for root, dirs, files in os.walk(base_dir):
-        if any(h in root for h in ["AppData", ".git", "node_modules", ".cache"]):
+    for base in search_dirs:
+        if not os.path.exists(base):
             continue
-        for f in files:
-            if q in f.lower():
-                matches.append(os.path.join(root, f))
-                if len(matches) >= 10:
-                    break
+        for root, dirs, files in os.walk(base):
+            dirs[:] = [d for d in dirs if not d.startswith(".") and d not in ["node_modules", "AppData", "__pycache__", "venv", ".cache"]]
+            for f in files:
+                if q in f.lower():
+                    matches.append(os.path.join(root, f))
+                    if len(matches) >= 10:
+                        break
+            if len(matches) >= 10:
+                break
         if len(matches) >= 10:
             break
+
     if not matches:
-        return f"No files matching '{query}' found in {base_dir}."
+        return f"No files matching '{query}' found in common directories."
     return "\n".join(matches)
 
 def read_file_content(file_path):
     """Reads the contents of a local file."""
     p = os.path.expanduser(file_path.strip().strip("'\""))
     if not os.path.exists(p):
-        return f"File does not exist: {p}"
+        cwd_p = os.path.join(os.getcwd(), p)
+        if os.path.exists(cwd_p):
+            p = cwd_p
+        else:
+            matches = search_local_files(os.path.basename(p))
+            first_match = matches.split("\n")[0] if matches and not matches.startswith("No files") else None
+            if first_match and os.path.exists(first_match):
+                p = first_match
+            else:
+                return f"File does not exist: {file_path}"
     try:
         with open(p, "r", encoding="utf-8", errors="ignore") as f:
             lines = f.readlines()
@@ -379,10 +575,14 @@ AVAILABLE_TOOLS = {
     "adjust_volume": adjust_volume,
     "get_installed_games": get_installed_games,
     "open_folder": open_folder,
-    "move_item": move_item,
-    "run_command": execute_command,
+    "list_folder": list_folder_contents,
+    "list_folder_contents": list_folder_contents,
     "search_files": search_local_files,
-    "read_file": read_file_content
+    "search_local_files": search_local_files,
+    "read_file": read_file_content,
+    "read_file_content": read_file_content,
+    "move_item": move_item,
+    "run_command": execute_command
 }
 
 def parse_and_execute_tool(text):
@@ -407,14 +607,18 @@ def parse_and_execute_tool(text):
                 args = [ast.literal_eval(a) for a in parsed_call.args]
                 kwargs = {k.arg: ast.literal_eval(k.value) for k in parsed_call.keywords}
                 res = func(*args, **kwargs)
-                if isinstance(res, list):
+                if isinstance(res, tuple):
+                    res = res[0]
+                elif isinstance(res, list):
                     res = ", ".join(res)
                 messages.append(f"[Action: {res}]")
             except Exception:
                 try:
                     arg_clean = raw_args.strip("'\"")
                     res = func(arg_clean) if arg_clean else func()
-                    if isinstance(res, list):
+                    if isinstance(res, tuple):
+                        res = res[0]
+                    elif isinstance(res, list):
                         res = ", ".join(res)
                     messages.append(f"[Action: {res}]")
                 except Exception as e:
@@ -486,56 +690,94 @@ def detect_and_run_intent(text):
             res = adjust_volume("mute")
             return True, f"[Action: {res}]", "Toggled volume mute for you.", False
 
-    # 5. YouTube Intent (clean extraction, avoids treating 'in my browser' as a search)
-    if "youtube" in t and any(w in t for w in ["open", "play", "launch", "start", "show", "watch", "want"]):
-        target = "https://www.youtube.com"
-        m = re.search(r'play\s+(.+?)\s+(?:on|in)\s+youtube', t)
+    # 5. YouTube Intent (clean extraction, avoids treating browser or filler as search, frank fallback)
+    if "youtube" in t and any(w in t for w in ["open", "play", "launch", "start", "show", "watch", "want", "search"]):
+        clean = re.sub(r'^(hey\s+jarvis\s*,?\s*|jarvis\s*,?\s*)', '', t)
+        m = re.search(r'play\s+(.+?)(?:\s+on|\s+in)?\s+youtube', clean)
         if not m:
-            m = re.search(r'(?:search\s+(?:on\s+)?youtube\s+for|youtube\s+search\s+(?:for\s+)?)(.+)', t)
-        if m:
-            query = m.group(1).strip()
-            query = re.sub(r'\b(in\s+my\s+browser|in\s+browser|in\s+firefox|in\s+chrome|please|tab|video)\b', '', query).strip()
-            if query and len(query) > 1:
-                target = f"https://www.youtube.com/results?search_query={urllib.parse.quote(query)}"
-        res = open_url(target, browser=browser)
-        speech = "Opening YouTube in Firefox for you." if browser == "firefox" else "Opening YouTube for you."
-        return True, f"[Action: {res}]", speech, False
+            m = re.search(r'(?:search\s+(?:on\s+)?youtube\s+for|youtube\s+search\s+(?:for\s+)?)(.+)', clean)
+        if not m:
+            m = re.search(r'open\s+youtube(?:\s+(?:and|to)\s+(?:search|play))?\s+(.+)', clean)
 
-    # 6. LeetCode Intent (fixes 404 on 'today', 'daily', etc.)
-    if "leetcode" in t and any(w in t for w in ["open", "show", "go to", "solve", "want", "do"]):
-        if any(w in t for w in ["today", "daily", "problemset", "problems", "list", "challenge"]) and not re.search(r'\b(two sum|three sum|valid parentheses|invert binary tree|reverse linked list)\b', t):
-            res = open_url("https://leetcode.com/problemset/", browser=browser)
-            return True, f"[Action: {res}]", "Opening LeetCode problem set in your browser.", False
-        
-        m = re.search(r'leetcode(?:\s+problem)?\s+[\'\"“]?([a-zA-Z0-9\s-]+)[\'\"”]?', t)
-        if m:
-            prob = m.group(1).strip()
-            prob = re.sub(r'\b(with\s+today|today|daily|problem|problems|website|solution|in|firefox|chrome|browser|please|with)\b', '', prob).strip()
-            if prob and len(prob) > 2:
-                res = open_leetcode(prob)
-                return True, f"[Action: {res}]", f"Opening LeetCode problem {prob} in your browser.", False
+        query = m.group(1).strip() if m else ""
+        query = re.sub(r'\b(in\s+my\s+browser|in\s+browser|in\s+firefox|in\s+chrome|please|for\s+me|tab|video|videos)\b', '', query).strip()
+        query = re.sub(r'^(for|about|with|the)\s+', '', query).strip()
+        query = query.strip('\'".,?! ')
 
-        res = open_url("https://leetcode.com/problemset/", browser=browser)
-        return True, f"[Action: {res}]", "Opening LeetCode in your browser.", False
+        if query in ["", "homepage", "app", "site", "website"]:
+            res = open_url("https://www.youtube.com", browser=browser)
+            speech = "Opening YouTube in Firefox for you." if browser == "firefox" else "Opening YouTube for you."
+            return True, f"[Action: {res}]", speech, False
+        elif query in ["something", "a video", "any video", "videos"]:
+            res = open_url("https://www.youtube.com", browser=browser)
+            speech = "I opened YouTube for you. To be frank, I wasn't sure what specific video or search you wanted, so I opened the homepage for you."
+            return True, f"[Action: {res}]", speech, False
+        else:
+            target = f"https://www.youtube.com/results?search_query={urllib.parse.quote(query)}"
+            res = open_url(target, browser=browser)
+            speech = f"Searching YouTube for {query}."
+            return True, f"[Action: Opened YouTube search for '{query}' ({target})]", speech, False
 
-    # 7. GitHub Intent
+    # 6. LeetCode Intent (smart GraphQL daily resolver, slug verification, frank fallback)
+    if "leetcode" in t and any(w in t for w in ["open", "show", "go to", "solve", "want", "do", "find", "challenge"]):
+        action, speech = open_leetcode(t, browser=browser)
+        return True, f"[Action: {action}]", speech, False
+
+    # 7. System Files Permission / Access Confirmation
+    if any(p in t for p in [
+        "access to system files", "access to files", "access system files", "access my files",
+        "can you access my files", "can you see my files", "why no access to system files",
+        "why this model has no access to system files", "do you have access to local files",
+        "do you have access to system files", "have access to files"
+    ]):
+        speech = "I do have direct access to your local system files, directories, and documents. I can search for files, read code, list folders like Downloads or Desktop, and execute terminal commands for you."
+        action = "[Action: Confirmed full local file system access (search_files, read_file, list_folder_contents, open_folder, move_item, run_command)]"
+        return True, action, speech, False
+
+    # 8. List Folder Contents ("what files are in downloads", "list files in desktop")
+    if any(w in t for w in ["what files", "list files", "show files", "what's in", "whats in", "what do i have in"]) and any(f in t for f in ["download", "desktop", "document", "picture", "folder", "project"]):
+        m = re.search(r'(?:in|of)\s+([a-zA-Z0-9_\-\\/\s]+)', t)
+        target = m.group(1).strip() if m else "downloads"
+        res = list_folder_contents(target, max_items=12)
+        preview_speech = f"Here are the files in your {target.strip().capitalize()} folder. I have displayed them on your screen."
+        return True, f"[Action: Listed folder contents]\n{res}", preview_speech, False
+
+    # 9. Search Local Files ("search for file requirements.txt", "find file ...", "where is file ...")
+    if any(t.startswith(prefix) for prefix in ["search for file ", "search file ", "find file ", "where is file ", "look for file ", "find the file "]):
+        clean_q = re.sub(r'^(search for file|search file|find file|where is file|look for file|find the file)\s+', '', t).strip()
+        clean_q = clean_q.strip('\'".,?! ')
+        if clean_q:
+            res = search_local_files(clean_q)
+            speech = f"I searched for {clean_q} on your system. I have placed the matching files on your screen."
+            return True, f"[Action: Searched for file '{clean_q}']\n{res}", speech, False
+
+    # 10. Read File Content ("read file X", "show file X", "what is inside file X")
+    if any(t.startswith(prefix) for prefix in ["read file ", "show file ", "view file ", "what is inside file ", "display file "]):
+        file_target = re.sub(r'^(read file|show file|view file|what is inside file|display file)\s+', '', t).strip()
+        file_target = file_target.strip('\'".,?! ')
+        if file_target:
+            res = read_file_content(file_target)
+            speech = f"I have read {file_target} and placed its contents on your screen."
+            return True, f"[Action: Read file '{file_target}']\n{res}", speech, False
+
+    # 11. GitHub Intent
     if "github" in t and any(w in t for w in ["open", "launch", "show", "go to"]):
         res = open_url("https://github.com", browser=browser)
         return True, f"[Action: {res}]", "Opening GitHub for you.", False
 
-    # 8. Screenshot Intent
+    # 12. Screenshot Intent
     if "screenshot" in t and any(w in t for w in ["take", "capture", "grab", "save"]):
         res = take_screenshot()
         return True, f"[Action: {res}]", "Screenshot taken and saved to your Pictures folder.", False
 
-    # 9. Folder Intent ("open downloads", "open pictures", "open folder C:/...")
+    # 13. Folder Intent ("open downloads", "open pictures", "open folder C:/...")
     if "open" in t and any(w in t for w in ["folder", "downloads", "pictures", "desktop", "documents"]):
         m = re.search(r'open\s+(?:folder\s+)?([a-zA-Z0-9_:\\/-]+)', t)
         folder = m.group(1).strip() if m else ""
         res = open_folder(folder)
         return True, f"[Action: {res}]", "Opened folder in File Explorer for you.", False
 
-    # 10. Terminal CLI Command Intent ("run command ipconfig", "run dir")
+    # 14. Terminal CLI Command Intent ("run command ipconfig", "run dir")
     if t.startswith("run command ") or t.startswith("execute command ") or t.startswith("run cli "):
         cmd = re.sub(r'^(run command|execute command|run cli)\s+', '', t).strip()
         if cmd:
@@ -545,7 +787,7 @@ def detect_and_run_intent(text):
             action_msg = f"[Action: Executed `{cmd}`]\n{preview}"
             return True, action_msg, f"Command {cmd} executed.", False
 
-    # 11. Application Launch Intent
+    # 15. Application Launch Intent
     if any(w in t for w in ["open", "launch", "start", "run"]):
         if "vs code" in t or "vscode" in t or "code" in t:
             res = open_app("code")
