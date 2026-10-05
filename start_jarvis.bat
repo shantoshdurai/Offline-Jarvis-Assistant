@@ -31,6 +31,6 @@ if not exist "%USERPROFILE%\.cache\huggingface\hub\models--Systran--faster-whisp
 )
 
 echo Starting Jarvis...
-python main.py
+python gui.py
 
 pause

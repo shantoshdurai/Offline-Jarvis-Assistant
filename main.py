@@ -12,28 +12,81 @@ import winsound
 import ctypes
 import pystray
 from PIL import Image, ImageDraw
+import site
+
+# Ensure CUDA dlls (cublas, cudnn) can be loaded for GPU-accelerated Whisper
+for s in site.getsitepackages() + [r"C:\Users\Dog\AppData\Local\Programs\Python\Python311\Lib\site-packages"]:
+    candidate = os.path.join(s, "torch", "lib")
+    if os.path.exists(candidate) and candidate not in os.environ.get("PATH", ""):
+        os.environ["PATH"] = candidate + os.pathsep + os.environ["PATH"]
+        if hasattr(os, "add_dll_directory"):
+            try: os.add_dll_directory(candidate)
+            except Exception: pass
+
+import ctranslate2
 from openwakeword.model import Model
 from faster_whisper import WhisperModel
 from llama_cpp import Llama
 
 # Configurations
 WAKE_WORD = "jarvis"  # We will use openwakeword's built-in models
+
+# Automatically detect best model in models/
 MODEL_PATH = "models/gemma-3-270m-it-Q4_K_M.gguf"
-SYSTEM_PROMPT = "You are Jarvis, a helpful and concise AI assistant. Keep your answers brief and conversational."
+if os.path.exists("models"):
+    candidates = [f for f in os.listdir("models") if f.endswith(".gguf")]
+    if candidates:
+        candidates.sort(key=lambda f: (
+            "coder" in f.lower(),
+            "qwen" in f.lower(),
+            "llama" in f.lower(),
+            os.path.getsize(os.path.join("models", f))
+        ), reverse=True)
+        MODEL_PATH = os.path.join("models", candidates[0])
+
+import re
+import tools
+
+SYSTEM_PROMPT = """You are Jarvis, an offline personal AI assistant and DSA coding mentor running 100% locally on Shantosh's laptop.
+You are powered by Qwen 2.5 Coder. You are NOT developed by OpenAI, NOT GPT-4, and NOT Gemini. Always identify yourself as Jarvis.
+
+VOICE & RESPONSE STYLE:
+- Your words are spoken aloud through text-to-speech. Never speak raw programming syntax, punctuation, or code lines.
+- When explaining an algorithm or concept, explain the intuition simply in 2-3 sentences.
+- Place actual code implementation cleanly in ```python ... ``` blocks.
+- Be an interactive pair programmer: offer hints, ask if the user wants the problem opened on LeetCode, or ask if they want to try it first.
+
+AVAILABLE TOOLS:
+You have real tools to control the computer. When asked to open something or perform an action, use the exact format on its own line:
+- Open website or search: <<TOOL: open_url("https://youtube.com", browser="firefox")>>
+- Open LeetCode problem: <<TOOL: open_leetcode("valid-parentheses")>>
+- Open local application: <<TOOL: open_app("firefox")>> (or "code", "notepad", "terminal", "chrome", "calc")
+- Take screenshot: <<TOOL: take_screenshot()>>
+- Open folder: <<TOOL: open_folder("C:/Users/Dog/Downloads")>>
+- Move file or folder: <<TOOL: move_item("source_path", "destination_path")>>
+- Run terminal command: <<TOOL: run_command("command")>>
+Always briefly tell the user what you are opening or doing."""
+HISTORY = [{"role": "system", "content": SYSTEM_PROMPT}]
 
 # Initialize Pygame Mixer for Audio Playback
 pygame.mixer.init()
 
-print("Loading LLM (Gemma 3 270M)...")
+print(f"Loading LLM ({os.path.basename(MODEL_PATH)})...")
 llm = Llama(
     model_path=MODEL_PATH,
     n_gpu_layers=-1, # Use all available GPU layers
-    n_ctx=2048,
+    n_ctx=4096,
     verbose=False
 )
 
-print("Loading Whisper Model (faster-whisper base.en)...")
-whisper_model = WhisperModel("base.en", device="cuda", compute_type="float16")
+whisper_device = "cuda" if ctranslate2.get_cuda_device_count() > 0 else "cpu"
+whisper_compute = "float16" if whisper_device == "cuda" else "int8"
+try:
+    print(f"Loading Whisper Model (faster-whisper small.en on {whisper_device.upper()})...")
+    whisper_model = WhisperModel("small.en", device=whisper_device, compute_type=whisper_compute)
+except Exception:
+    print("Loading Whisper Model (faster-whisper base.en fallback)...")
+    whisper_model = WhisperModel("base.en", device="cpu", compute_type="int8")
 
 print("Loading Wake Word Model (openwakeword)...")
 owwModel = Model(wakeword_models=["hey_jarvis"], inference_framework="onnx")
@@ -51,14 +104,31 @@ mic_stream = audio.open(format=FORMAT, channels=CHANNELS, rate=RATE, input=True,
 is_processing = threading.Event()
 voice_command_queue = queue.Queue()
 
+def clean_for_speech(text):
+    if not text:
+        return ""
+    t = re.sub(r'<<TOOL:.*?>>', '', text)
+    t = re.sub(r'```[\s\S]*?```', ' I have placed the code implementation on your screen. ', t)
+    if "```" in t:
+        t = t.split("```")[0] + ' I have placed the code implementation on your screen. '
+    t = re.sub(r'`([^`]+)`', r'\1', t)
+    t = re.sub(r'#+\s*', '', t)
+    t = re.sub(r'\*\*([^*]+)\*\*', r'\1', t)
+    t = re.sub(r'\*([^*]+)\*', r'\1', t)
+    t = re.sub(r'[-*]\s+', '', t)
+    t = re.sub(r'https?://\S+', '', t)
+    return re.sub(r'\s+', ' ', t).strip()
+
 def speak(text):
     print(f"\nJarvis: {text}")
+    spoken_text = clean_for_speech(text)
+    if not spoken_text:
+        return
     output_file = "reply.mp3"
     text_file = "reply.txt"
     try:
-        # Write to file to completely bypass Windows command-line escaping bugs with special characters
         with open(text_file, "w", encoding="utf-8") as f:
-            f.write(text)
+            f.write(spoken_text)
             
         subprocess.run(["edge-tts", "--voice", "en-GB-RyanNeural", "--rate=+10%", "--volume=+100%", "-f", text_file, "--write-media", output_file], check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=15)
         pygame.mixer.music.load(output_file)
@@ -71,7 +141,7 @@ def speak(text):
     except Exception as e:
         print(f"(TTS Error: {e})")
 
-def record_audio(max_duration=15, silence_limit=1.2, start_timeout=3.0):
+def record_audio(max_duration=20, silence_limit=2.0, start_timeout=5.0):
     print("\n[Listening... Speak now!]")
     winsound.MessageBeep(winsound.MB_ICONASTERISK) # Ding sound
     
@@ -96,8 +166,8 @@ def record_audio(max_duration=15, silence_limit=1.2, start_timeout=3.0):
         audio_data = np.frombuffer(data, dtype=np.int16)
         volume = np.abs(audio_data).mean()
         
-        # Threshold adjusted for your hardware (your noise floor is ~1000)
-        if volume > 2000: 
+        # Threshold adjusted for laptop mic (noise floor is ~650, speech ~850+)
+        if volume > 850: 
             talking_started = True
             silent_chunks = 0
         elif talking_started:
@@ -120,14 +190,32 @@ def record_audio(max_duration=15, silence_limit=1.2, start_timeout=3.0):
     return 'input.wav'
 
 def transcribe(audio_file):
-    segments, info = whisper_model.transcribe(audio_file, beam_size=5)
+    segments, info = whisper_model.transcribe(audio_file, beam_size=5, condition_on_previous_text=False)
     text = "".join([segment.text for segment in segments])
     return text.strip()
 
 def generate_response(user_text):
-    prompt = f"<start_of_turn>system\n{SYSTEM_PROMPT}<end_of_turn>\n<start_of_turn>user\n{user_text}<end_of_turn>\n<start_of_turn>model\n"
-    output = llm(prompt, max_tokens=150, stop=["<end_of_turn>", "<start_of_turn>"], echo=False)
-    return output['choices'][0]['text'].strip()
+    global HISTORY
+    HISTORY.append({"role": "user", "content": user_text})
+    try:
+        response = llm.create_chat_completion(
+            messages=HISTORY,
+            max_tokens=1024,
+            temperature=0.6,
+            repeat_penalty=1.15,
+        )
+        reply = response['choices'][0]['message']['content'].strip()
+        HISTORY.append({"role": "assistant", "content": reply})
+
+        # Check and execute tools
+        found, action_msg, clean_text = tools.parse_and_execute_tool(reply)
+        if found and action_msg:
+            print(f"\n{action_msg}")
+            speak(action_msg.replace("[Action: ", "").replace("]", ""))
+
+        return reply
+    except Exception as e:
+        return f"Error: {e}"
 
 def wake_word_listener():
     """Background thread that constantly listens for 'Jarvis'"""

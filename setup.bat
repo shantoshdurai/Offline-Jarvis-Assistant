@@ -22,12 +22,12 @@ if not exist "models\gemma-3-270m-it-Q4_K_M.gguf" (
     hf download lmstudio-community/gemma-3-270m-it-GGUF gemma-3-270m-it-Q4_K_M.gguf --local-dir models
 )
 
-if not exist "%USERPROFILE%\.cache\huggingface\hub\models--Systran--faster-whisper-base.en" (
+if not exist "%USERPROFILE%\.cache\huggingface\hub\models--Systran--faster-whisper-small.en" (
     echo.
     echo =======================================================
-    echo Downloading Whisper Voice Recognition Model...
+    echo Downloading Whisper Voice Recognition Model (small.en)...
     echo =======================================================
-    hf download Systran/faster-whisper-base.en
+    hf download Systran/faster-whisper-small.en
 )
 
 echo.

@@ -7,7 +7,13 @@ soundfile
 numpy
 scipy
 huggingface_hub
-llama-cpp-python --extra-index-url https://abetlen.github.io/llama-cpp-python/whl/cpu --only-binary llama-cpp-python
+llama-cpp-python
 pyaudio
 pystray
 pillow
+psutil
+pynvml
+nvidia-ml-py
+customtkinter
+pywin32
+mss
