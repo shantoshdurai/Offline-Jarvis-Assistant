@@ -59,8 +59,9 @@ if getattr(sys, 'frozen', False):
     sys.stderr = DummyFile()
 
 # --- CONFIGURATION ---
-SYSTEM_PROMPT = """You are Jarvis, an offline personal AI assistant and DSA coding mentor running 100% locally on Shantosh's laptop.
+SYSTEM_PROMPT = """You are Jarvis, an offline personal AI assistant, system copilot, and DSA coding mentor running 100% locally on Shantosh's laptop.
 You are powered by Qwen 2.5 Coder. You are NOT developed by OpenAI, NOT GPT-4, and NOT Gemini. Always identify yourself as Jarvis.
+You have direct local access to Shantosh's Windows computer: files, desktop, installed games, display brightness, volume, and terminal CLI.
 
 VOICE & RESPONSE STYLE:
 - Your words are spoken aloud through text-to-speech. Never speak raw programming syntax, punctuation, or code lines.
@@ -68,16 +69,19 @@ VOICE & RESPONSE STYLE:
 - Place actual code implementation cleanly in ```python ... ``` blocks.
 - Be an interactive pair programmer: offer hints, ask if the user wants the problem opened on LeetCode, or ask if they want to try it first.
 
-AVAILABLE TOOLS:
-You have real tools to control the computer. When asked to open something or perform an action, use the exact format on its own line:
-- Open website or search: <<TOOL: open_url("https://youtube.com", browser="firefox")>>
-- Open LeetCode problem: <<TOOL: open_leetcode("valid-parentheses")>>
-- Open local application: <<TOOL: open_app("firefox")>> (or "code", "notepad", "terminal", "chrome", "calc")
+AVAILABLE TOOLS & HARDWARE CONTROLS:
+You have real tools to control the computer. When asked to perform an action, use the exact format on its own line:
+- Screen Vision / OCR: <<TOOL: inspect_screen()>>
+- Check Installed Games: <<TOOL: get_installed_games()>>
+- Adjust Brightness: <<TOOL: adjust_brightness("increase")>> (or "decrease", "set", 80)
+- Adjust Volume: <<TOOL: adjust_volume("increase")>> (or "decrease", "mute")
+- Open website: <<TOOL: open_url("https://youtube.com", browser="firefox")>>
+- Open LeetCode: <<TOOL: open_leetcode("two-sum")>>
+- Open application: <<TOOL: open_app("firefox")>> (or "code", "notepad", "terminal", "chrome", "calc")
 - Take screenshot: <<TOOL: take_screenshot()>>
-- Open folder: <<TOOL: open_folder("C:/Users/Dog/Downloads")>>
-- Move file or folder: <<TOOL: move_item("source_path", "destination_path")>>
+- Open folder: <<TOOL: open_folder("Downloads")>>
 - Run terminal command: <<TOOL: run_command("command")>>
-Always briefly tell the user what you are opening or doing."""
+Always briefly tell the user what you are doing."""
 
 HISTORY = [{"role": "system", "content": SYSTEM_PROMPT}]
 is_processing = threading.Event()
@@ -87,8 +91,8 @@ class JarvisGUI(ctk.CTk):
     def __init__(self):
         super().__init__()
         
-        self.title("Jarvis AI Assistant — DSA Mentor & System Copilot")
-        self.geometry("1180x730")
+        self.title("Jarvis AI Assistant — System Copilot & DSA Mentor")
+        self.geometry("1180x740")
         self.minsize(980, 620)
         ctk.set_appearance_mode("dark")
         ctk.set_default_color_theme("blue")
@@ -101,6 +105,7 @@ class JarvisGUI(ctk.CTk):
         self.gpu_device_name = "Detecting GPU..."
         self.active_model_name = "Loading..."
         self._is_closed = False
+        self.is_followup_turn = False
         
         # Thread-safe UI Dispatcher
         self.ui_queue = queue.Queue()
@@ -141,19 +146,19 @@ class JarvisGUI(ctk.CTk):
         self.stop_btn.grid(row=0, column=3)
 
         # --- RIGHT PANEL: PERFORMANCE & TELEMETRY SIDEBAR ---
-        self.sidebar = ctk.CTkFrame(self, width=300, corner_radius=12, fg_color="#181a20")
+        self.sidebar = ctk.CTkFrame(self, width=310, corner_radius=12, fg_color="#181a20")
         self.sidebar.grid(row=0, column=1, rowspan=3, padx=(10, 20), pady=20, sticky="nsew")
         self.sidebar.grid_propagate(False)
 
         # Header
         sb_header = ctk.CTkLabel(self.sidebar, text="⚡ SYSTEM TELEMETRY", font=("Consolas", 15, "bold"), text_color="#00d2d3")
-        sb_header.pack(pady=(14, 8), padx=14, anchor="w")
+        sb_header.pack(pady=(12, 6), padx=14, anchor="w")
 
         # 1. Engine & Acceleration Card
         self.engine_card = ctk.CTkFrame(self.sidebar, fg_color="#22252e", corner_radius=8)
-        self.engine_card.pack(fill="x", padx=12, pady=4)
+        self.engine_card.pack(fill="x", padx=12, pady=3)
         
-        ctk.CTkLabel(self.engine_card, text="AI ACCELERATION & MODEL", font=("Arial", 9, "bold"), text_color="#8395a7").pack(anchor="w", padx=10, pady=(6, 2))
+        ctk.CTkLabel(self.engine_card, text="AI ACCELERATION & MODEL", font=("Arial", 9, "bold"), text_color="#8395a7").pack(anchor="w", padx=10, pady=(5, 1))
         
         self.lbl_model = ctk.CTkLabel(self.engine_card, text="Model: Qwen 2.5 Coder 3B", font=("Arial", 11, "bold"), text_color="#ffffff")
         self.lbl_model.pack(anchor="w", padx=10, pady=1)
@@ -162,31 +167,35 @@ class JarvisGUI(ctk.CTk):
         self.lbl_device.pack(anchor="w", padx=10, pady=1)
 
         self.lbl_stt = ctk.CTkLabel(self.engine_card, text="STT: Whisper small.en (CUDA)", font=("Arial", 10), text_color="#bdc3c7")
-        self.lbl_stt.pack(anchor="w", padx=10, pady=(1, 6))
+        self.lbl_stt.pack(anchor="w", padx=10, pady=(1, 5))
 
         # 2. Real-Time Generation Speed Card (Live TPS & Latency)
         self.gen_card = ctk.CTkFrame(self.sidebar, fg_color="#22252e", corner_radius=8)
-        self.gen_card.pack(fill="x", padx=12, pady=4)
+        self.gen_card.pack(fill="x", padx=12, pady=3)
 
-        ctk.CTkLabel(self.gen_card, text="LIVE GENERATION PERFORMANCE", font=("Arial", 9, "bold"), text_color="#8395a7").pack(anchor="w", padx=10, pady=(6, 2))
+        ctk.CTkLabel(self.gen_card, text="LIVE GENERATION PERFORMANCE", font=("Arial", 9, "bold"), text_color="#8395a7").pack(anchor="w", padx=10, pady=(5, 1))
 
         self.lbl_tps_val = ctk.CTkLabel(self.gen_card, text="0.0 TPS", font=("Consolas", 22, "bold"), text_color="#00d2d3")
-        self.lbl_tps_val.pack(anchor="w", padx=10, pady=(0, 2))
+        self.lbl_tps_val.pack(anchor="w", padx=10, pady=(0, 1))
 
-        self.lbl_latency = ctk.CTkLabel(self.gen_card, text="Ready (0 tokens)", font=("Arial", 11), text_color="#bdc3c7")
-        self.lbl_latency.pack(anchor="w", padx=10, pady=(0, 6))
+        self.lbl_latency = ctk.CTkLabel(self.gen_card, text="Ready (0 tokens)", font=("Arial", 10), text_color="#bdc3c7")
+        self.lbl_latency.pack(anchor="w", padx=10, pady=(0, 2))
+
+        # STT Latency & Speedup
+        self.lbl_stt_speed = ctk.CTkLabel(self.gen_card, text="STT Speed: Ready", font=("Arial", 10), text_color="#bdc3c7")
+        self.lbl_stt_speed.pack(anchor="w", padx=10, pady=(0, 5))
 
         # 3. Hardware Resource Utilization Card (GPU VRAM, GPU %, RAM, CPU)
         self.hw_card = ctk.CTkFrame(self.sidebar, fg_color="#22252e", corner_radius=8)
-        self.hw_card.pack(fill="x", padx=12, pady=4)
+        self.hw_card.pack(fill="x", padx=12, pady=3)
 
-        ctk.CTkLabel(self.hw_card, text="HARDWARE METRICS (LIVE)", font=("Arial", 9, "bold"), text_color="#8395a7").pack(anchor="w", padx=10, pady=(6, 4))
+        ctk.CTkLabel(self.hw_card, text="HARDWARE METRICS (LIVE)", font=("Arial", 9, "bold"), text_color="#8395a7").pack(anchor="w", padx=10, pady=(5, 3))
 
         # VRAM
         self.lbl_vram = ctk.CTkLabel(self.hw_card, text="GPU VRAM: 0.00 / 4.00 GB (0%)", font=("Arial", 10), text_color="#ecf0f1")
         self.lbl_vram.pack(anchor="w", padx=10, pady=1)
         self.prog_vram = ctk.CTkProgressBar(self.hw_card, height=6, progress_color="#3498db")
-        self.prog_vram.pack(fill="x", padx=10, pady=(1, 4))
+        self.prog_vram.pack(fill="x", padx=10, pady=(1, 3))
         self.prog_vram.set(0.0)
 
         # GPU Util
@@ -197,29 +206,40 @@ class JarvisGUI(ctk.CTk):
         self.lbl_ram = ctk.CTkLabel(self.hw_card, text="System RAM: 0.0 / 0.0 GB (0%)", font=("Arial", 10), text_color="#ecf0f1")
         self.lbl_ram.pack(anchor="w", padx=10, pady=1)
         self.prog_ram = ctk.CTkProgressBar(self.hw_card, height=6, progress_color="#9b59b6")
-        self.prog_ram.pack(fill="x", padx=10, pady=(1, 4))
+        self.prog_ram.pack(fill="x", padx=10, pady=(1, 3))
         self.prog_ram.set(0.0)
 
         # CPU
         self.lbl_cpu = ctk.CTkLabel(self.hw_card, text="CPU Usage: 0%", font=("Arial", 10), text_color="#ecf0f1")
-        self.lbl_cpu.pack(anchor="w", padx=10, pady=(1, 6))
+        self.lbl_cpu.pack(anchor="w", padx=10, pady=(1, 5))
 
-        # 4. Audio & Microphone Activity Card
+        # 4. Mode & Microphone Activity Card
         self.audio_card = ctk.CTkFrame(self.sidebar, fg_color="#22252e", corner_radius=8)
-        self.audio_card.pack(fill="x", padx=12, pady=4)
+        self.audio_card.pack(fill="x", padx=12, pady=3)
 
-        ctk.CTkLabel(self.audio_card, text="MICROPHONE ACTIVITY", font=("Arial", 9, "bold"), text_color="#8395a7").pack(anchor="w", padx=10, pady=(6, 2))
+        ctk.CTkLabel(self.audio_card, text="CONVERSATION & MIC", font=("Arial", 9, "bold"), text_color="#8395a7").pack(anchor="w", padx=10, pady=(5, 2))
         
+        # Continuous / Side Agent Toggle Switch
+        self.continuous_mode_var = ctk.BooleanVar(value=True)
+        self.mode_switch = ctk.CTkSwitch(
+            self.audio_card,
+            text="Continuous / Side Agent Mode",
+            variable=self.continuous_mode_var,
+            font=("Arial", 10, "bold"),
+            progress_color="#2ecc71"
+        )
+        self.mode_switch.pack(anchor="w", padx=10, pady=(2, 4))
+
         self.lbl_mic_status = ctk.CTkLabel(self.audio_card, text="Wake Word: Hey Jarvis (Ready)", font=("Arial", 10), text_color="#2ecc71")
         self.lbl_mic_status.pack(anchor="w", padx=10, pady=1)
 
         self.prog_mic = ctk.CTkProgressBar(self.audio_card, height=7, progress_color="#2ecc71")
-        self.prog_mic.pack(fill="x", padx=10, pady=(3, 6))
+        self.prog_mic.pack(fill="x", padx=10, pady=(2, 6))
         self.prog_mic.set(0.0)
 
         # Bottom System Tray notice & Complete Terminate Button
         self.lbl_tray_info = ctk.CTkLabel(self.sidebar, text="📌 Running in system tray (^)", font=("Arial", 9), text_color="#7f8c8d")
-        self.lbl_tray_info.pack(pady=(6, 2))
+        self.lbl_tray_info.pack(pady=(4, 2))
 
         self.btn_quit_all = ctk.CTkButton(
             self.sidebar, text="⏻ Quit Jarvis Completely", 
@@ -227,7 +247,7 @@ class JarvisGUI(ctk.CTk):
             fg_color="#c0392b", hover_color="#962d22",
             height=30, font=("Arial", 11, "bold")
         )
-        self.btn_quit_all.pack(fill="x", padx=12, pady=(0, 12), side="bottom")
+        self.btn_quit_all.pack(fill="x", padx=12, pady=(0, 10), side="bottom")
 
         # Models and Audio
         self.llm = None
@@ -263,7 +283,6 @@ class JarvisGUI(ctk.CTk):
     def setup_tray(self):
         """Initializes a Windows hidden system tray icon with full process termination support."""
         try:
-            # Generate a 64x64 RGBA AI Orb icon
             size = 64
             img = Image.new("RGBA", (size, size), (0, 0, 0, 0))
             draw = ImageDraw.Draw(img)
@@ -328,6 +347,7 @@ class JarvisGUI(ctk.CTk):
 
     def reset_to_listening(self):
         """Cleanly restores state back to listening for wake word."""
+        self.is_followup_turn = False
         self.post_ui(self._set_status_impl, "Listening for 'Hey Jarvis'...", "lightgreen")
         self.post_ui(self._set_widget_attr, self.lbl_mic_status, "text", "Wake Word: Hey Jarvis (Ready)", "text_color", "#2ecc71")
         self.post_ui(self._update_mic_level_impl, 0.0)
@@ -351,14 +371,12 @@ class JarvisGUI(ctk.CTk):
         """Immediately halts AI generation, voice output, drains mic, and resets to listening."""
         self.stop_event.set()
         
-        # Instantly purge speech in 0ms via native SAPI flag 2 (SVSFPurgeBeforeSpeak)
         if hasattr(self, "sapi_voice") and self.sapi_voice:
             try:
-                self.sapi_voice.Speak("", 2)
+                self.sapi_voice.Speak("", 2) # Flag 2 = SVSFPurgeBeforeSpeak
             except Exception:
                 pass
             
-        # Clear speech queue
         while not self.tts_queue.empty():
             try:
                 self.tts_queue.get_nowait()
@@ -447,6 +465,15 @@ class JarvisGUI(ctk.CTk):
         except Exception:
             pass
 
+    def set_stt_metrics(self, stt_latency, speedup):
+        self.post_ui(self._set_stt_metrics_impl, stt_latency, speedup)
+
+    def _set_stt_metrics_impl(self, stt_latency, speedup):
+        try:
+            self.lbl_stt_speed.configure(text=f"STT Speed: {stt_latency:.2f}s ({speedup:.1f}x real-time)")
+        except Exception:
+            pass
+
     def update_mic_level(self, volume):
         self.post_ui(self._update_mic_level_impl, volume)
 
@@ -468,14 +495,12 @@ class JarvisGUI(ctk.CTk):
 
         while not self._is_closed:
             try:
-                # 1. System RAM & CPU
                 mem = psutil.virtual_memory()
                 ram_used = mem.used / (1024**3)
                 ram_total = mem.total / (1024**3)
                 ram_pct = mem.percent
                 cpu_pct = psutil.cpu_percent()
 
-                # 2. NVIDIA GPU stats via NVML
                 vram_used = 0.0
                 vram_total = 4.0
                 vram_pct = 0
@@ -565,19 +590,27 @@ class JarvisGUI(ctk.CTk):
                 time.sleep(0.4)
                 self.flush_mic_buffer()
                 self.is_speaking_lock.clear()
-                self.reset_to_listening()
+                
+                # Continuous / Side Agent follow-up turn!
+                if self.continuous_mode_var.get() and not self.stop_event.is_set():
+                    self.is_followup_turn = True
+                    self.set_status("Listening for follow-up... (Speak now)", "#00d2d3")
+                    self.post_ui(self._set_widget_attr, self.lbl_mic_status, "text", "Mic: Listening for follow-up...", "text_color", "#00d2d3")
+                    voice_command_queue.put(True)
+                else:
+                    self.reset_to_listening()
 
     def load_models(self):
         try:
-            # Automatically find the best model available in models/
-            model_path = "models/gemma-3-270m-it-Q4_K_M.gguf"
+            # Prioritize: 1) Q2_K (fastest 2-bit quantization, ~51.3 TPS), 2) Q4_K_M, 3) Coder
+            model_path = "models/qwen2.5-coder-3b-instruct-q2_k.gguf"
             if os.path.exists("models"):
                 candidates = [f for f in os.listdir("models") if f.endswith(".gguf")]
                 if candidates:
                     candidates.sort(key=lambda f: (
+                        "q2_k" in f.lower(),
                         "coder" in f.lower(),
                         "qwen" in f.lower(),
-                        "llama" in f.lower(),
                         os.path.getsize(os.path.join("models", f))
                     ), reverse=True)
                     model_path = os.path.join("models", candidates[0])
@@ -608,7 +641,7 @@ class JarvisGUI(ctk.CTk):
                 self.gpu_device_name = "CPU Only (Fallback)"
                 self.post_ui(self._set_widget_attr, self.lbl_device, "text", "Device: CPU Fallback", "text_color", "#e67e22")
 
-            short_model_name = "Qwen 2.5 Coder 3B" if "qwen" in model_name.lower() else model_name[:22]
+            short_model_name = "Qwen 2.5 Coder (Q2_K 2-bit)" if "q2_k" in model_name.lower() else ("Qwen 2.5 Coder 3B" if "qwen" in model_name.lower() else model_name[:22])
             self.post_ui(self._set_widget_attr, self.lbl_model, "text", f"Model: {short_model_name}")
 
             self.update_chat("System", "Loading Whisper (Ears)...", "gray")
@@ -692,19 +725,24 @@ class JarvisGUI(ctk.CTk):
 
     def handle_voice_interaction(self):
         is_processing.set()
-        self.set_status("Listening... Speak now!", "orange")
-        self.post_ui(self._set_widget_attr, self.lbl_mic_status, "text", "Mic: Recording Voice...", "text_color", "#f39c12")
+        
+        if self.is_followup_turn:
+            self.set_status("Listening for follow-up... (Speak now)", "#00d2d3")
+            self.post_ui(self._set_widget_attr, self.lbl_mic_status, "text", "Mic: Listening for follow-up...", "text_color", "#00d2d3")
+        else:
+            self.set_status("Listening... Speak now!", "orange")
+            self.post_ui(self._set_widget_attr, self.lbl_mic_status, "text", "Mic: Recording Voice...", "text_color", "#f39c12")
         
         frames = []
         silent_chunks = 0
         chunks_per_second = self.RATE / self.CHUNK
         max_silent_chunks = int(1.8 * chunks_per_second)
         max_total_chunks = int(20 * chunks_per_second)
-        timeout_chunks = int(6.0 * chunks_per_second)
+        timeout_chunks = int(5.5 * chunks_per_second)
         talking_started = False
         
         self.flush_mic_buffer()
-        SPEECH_THRESHOLD = 260
+        SPEECH_THRESHOLD = 260 # Calibrated for laptop Realtek mic array
             
         for i in range(max_total_chunks):
             if self.stop_event.is_set() or self._is_closed:
@@ -733,6 +771,11 @@ class JarvisGUI(ctk.CTk):
             self.reset_to_listening()
             return
 
+        # Crucial: If user never actually started speaking, DO NOT transcribe room silence!
+        if not talking_started:
+            self.reset_to_listening()
+            return
+
         with wave.open('input.wav', 'wb') as wf:
             wf.setnchannels(self.CHANNELS)
             wf.setsampwidth(self.audio.get_sample_size(self.FORMAT))
@@ -742,14 +785,34 @@ class JarvisGUI(ctk.CTk):
         self.set_status("Transcribing...", "yellow")
         self.post_ui(self._set_widget_attr, self.lbl_mic_status, "text", "Mic: Transcribing...", "text_color", "#f1c40f")
         try:
+            t_trans_start = time.time()
             segments, _ = self.whisper_model.transcribe(
                 "input.wav",
                 beam_size=5,
                 language="en",
-                initial_prompt="Jarvis, Hey Jarvis, LeetCode, DSA, Python, Firefox, YouTube, Chrome, binary search, algorithms.",
+                initial_prompt="Jarvis, Hey Jarvis, LeetCode, DSA, Python, Firefox, YouTube, Chrome, binary search, algorithms, games, brightness.",
                 condition_on_previous_text=False
             )
             raw_text = "".join(segment.text for segment in segments).strip()
+            t_trans_end = time.time()
+            
+            stt_latency = t_trans_end - t_trans_start
+            audio_duration = len(frames) * self.CHUNK / self.RATE
+            speedup = (audio_duration / stt_latency) if stt_latency > 0 else 0.0
+            self.set_stt_metrics(stt_latency, speedup)
+
+            # Silence hallucination filter
+            HALLUCINATIONS = [
+                "thanks for watching", "thank you for watching", "see you next time",
+                "subscribe for more", "like and subscribe", "please subscribe",
+                "thank you", "bye", "you", "..."
+            ]
+            clean_lower = re.sub(r'[^a-zA-Z0-9\s]', '', raw_text.lower()).strip()
+            if any(clean_lower == h or clean_lower.startswith(h) for h in HALLUCINATIONS) and len(clean_lower.split()) < 7:
+                print(f"Discarded Whisper silence hallucination: '{raw_text}'")
+                self.reset_to_listening()
+                return
+
             user_text = re.sub(r'\b(jervis|travis|service|jarves|charvis)\b', 'Jarvis', raw_text, flags=re.IGNORECASE).strip()
             
             if user_text and len(user_text) > 1:
@@ -777,31 +840,32 @@ class JarvisGUI(ctk.CTk):
         is_processing.set()
         self.stop_event.clear()
         
-        # 1. Direct tool & intent execution (instant action for YouTube, Firefox, LeetCode, Apps, Screenshot)
-        handled, action_msg, speech_response = tools.detect_and_run_intent(text)
+        # 1. Direct tool & intent execution (hardware controls, vision, apps, web, games)
+        handled, action_msg, speech_response, needs_llm = tools.detect_and_run_intent(text)
         if handled:
             self.update_chat("You", text, "white")
             if action_msg:
                 self.update_chat("System", action_msg, "#3498db")
-            if speech_response:
+            if speech_response and not needs_llm:
                 self.update_chat("Jarvis", speech_response, "#f1c40f")
                 self.tts_queue.put(speech_response)
-
-            lower = text.lower()
-            coding_words = ["explain", "how", "why", "what", "solve", "algorithm", "implement", "code", "complexity", "dsa"]
-            has_question = any(w in lower for w in coding_words)
-            if not has_question or len(text.split()) < 8:
                 self.set_status("Action completed.", "lightgreen")
                 return
 
-        # 2. If not handled or user also asked a question, pass to LLM
-        if not handled:
-            self.update_chat("You", text, "white")
+        # 2. If screen vision was triggered, inject on-screen code/text into prompt
+        actual_prompt = text
+        if handled and needs_llm:
+            screen_data = tools.inspect_screen()
+            actual_prompt = f"{text}\n\n[Current On-Screen Text and Code Captured via Vision OCR]:\n{screen_data[:2000]}"
+            self.set_status("Analyzing screen...", "#00d2d3")
+        else:
+            if not handled:
+                self.update_chat("You", text, "white")
+            self.set_status("Jarvis is thinking...", "yellow")
 
-        self.set_status("Jarvis is thinking...", "yellow")
         self.set_generation_metrics(0.0, 0.0, 0, "Generating...")
         
-        HISTORY.append({"role": "user", "content": text})
+        HISTORY.append({"role": "user", "content": actual_prompt})
         
         try:
             self.start_assistant_message()
