@@ -63,6 +63,7 @@ except ImportError:
 # Local modules
 import tools
 from parakeet_stt import ParakeetEOU
+from overlay_widget import FloatingVoicePill
 
 # Load environment configuration
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
@@ -75,7 +76,7 @@ else:
 OPENROUTER_API_KEY = os.getenv("OPENROUTER_API_KEY", "")
 OPENROUTER_MODEL = os.getenv("OPENROUTER_MODEL", "deepseek/deepseek-v4.1-flash")
 FALLBACK_MODEL = os.getenv("FALLBACK_MODEL", "openrouter/free")
-WAKE_THRESHOLD = float(os.getenv("WAKE_THRESHOLD", "0.18"))
+WAKE_THRESHOLD = float(os.getenv("WAKE_THRESHOLD", "0.22"))
 
 # Audio settings
 FORMAT = pyaudio.paInt16
@@ -90,7 +91,8 @@ except Exception:
     pass
 
 SYSTEM_PROMPT = """You are Jarvis, Shantosh's lightning-fast personal AI assistant and pair programmer running on his Windows PC.
-You are powered by DeepSeek 4.1 Flash. Always identify as Jarvis.
+Always identify as Jarvis. You are powered by DeepSeek via OpenRouter.
+If Shantosh asks who you are, what model you are, or what version you are running, state clearly: "I am Jarvis, powered by DeepSeek via OpenRouter." Never claim to be Claude, Anthropic, ChatGPT, or OpenAI.
 
 MODALITY AWARENESS:
 Shantosh communicates with you via two tagged input types:
@@ -393,6 +395,15 @@ class FastAgent:
         # 9. Global Hotkey Listener (Ctrl+Shift+Space and Ctrl+Alt+J)
         self.setup_hotkey()
 
+        # 10. OpenWhispr Floating Voice Pill Overlay
+        print("Launching OpenWhispr Floating Voice Pill Overlay...")
+        try:
+            self.pill = FloatingVoicePill()
+            print("[OK] Floating Voice Pill active (animated waveform overlay)")
+        except Exception as e:
+            print(f"[Notice] Floating overlay disabled: {e}")
+            self.pill = None
+
     def get_whisper(self):
         """Lazy loader for faster-whisper fallback."""
         if self.whisper_model is None:
@@ -401,14 +412,17 @@ class FastAgent:
         return self.whisper_model
 
     def play_chime(self, sound_type: str = "start"):
-        """Audible feedback chime."""
-        try:
-            if sound_type == "start":
-                winsound.MessageBeep(winsound.MB_ICONASTERISK)
-            elif sound_type == "end":
-                winsound.MessageBeep(winsound.MB_OK)
-        except Exception:
-            pass
+        """Play OpenWhispr synthesized harmonic chime."""
+        if hasattr(self, "pill") and self.pill:
+            self.pill.play_sfx(sound_type)
+        else:
+            try:
+                if sound_type == "start":
+                    winsound.MessageBeep(winsound.MB_ICONASTERISK)
+                elif sound_type in ("end", "stop"):
+                    winsound.MessageBeep(winsound.MB_OK)
+            except Exception:
+                pass
 
     def setup_tray(self):
         """Setup Windows notification tray icon with controls."""
@@ -523,7 +537,26 @@ class FastAgent:
             except Exception as e2:
                 print(f"(Speech playback error: {e2})")
         finally:
+            # 1. Allow speaker reverberation in room to dissipate
+            time.sleep(0.35)
+            # 2. Flush microphone stream buffer so speaker audio is never re-processed
+            try:
+                while self.mic_stream.get_read_available() > 0:
+                    self.mic_stream.read(self.mic_stream.get_read_available(), exception_on_overflow=False)
+            except Exception:
+                pass
+            # 3. Reset wake word detector state
+            if self.oww is not None:
+                self.oww.reset()
+            # 4. Drain any pending false triggers from command queue
+            while not self.command_queue.empty():
+                try:
+                    self.command_queue.get_nowait()
+                except queue.Empty:
+                    break
             self.is_speaking.clear()
+            if hasattr(self, "pill") and self.pill:
+                self.pill.set_state("idle")
 
     def query_llm(self, user_text: str) -> Tuple[str, List[Dict[str, Any]]]:
         """Query DeepSeek 4.1 Flash via OpenRouter with automatic fallback to free models."""
@@ -576,6 +609,17 @@ class FastAgent:
 
     def execute_command_pipeline(self, user_text: str, source: str = "voice"):
         """Process user command, call LLM & tools, and speak reply."""
+        # Filter out brief acoustic noise, coughs, or empty filler murmurs
+        clean_text = user_text.lower().strip(" .,?!\"'")
+        if clean_text in ("", "mmhm", "mhm", "uh", "um", "ah", "hm", "huh", "yeah", "ok", "okay"):
+            print(f"(Ignored brief acoustic noise/filler: '{user_text}')")
+            if hasattr(self, "pill") and self.pill:
+                self.pill.set_state("idle")
+            return
+
+        if hasattr(self, "pill") and self.pill:
+            self.pill.set_state("processing")
+
         if source == "voice":
             print(f"\n📝 Heard (Voice): \"{user_text}\"")
             prompt = f"[Voice Input]: {user_text}"
@@ -610,12 +654,17 @@ class FastAgent:
 
         self.history.append({"role": "assistant", "content": spoken_response})
         print(f"⚡ Latency: LLM {t_llm:.2f}s")
+        if hasattr(self, "pill") and self.pill:
+            self.pill.set_state("speaking")
         self.tts_speak(spoken_response)
 
-    def record_audio(self, max_duration: float = 12.0, silence_limit: float = 1.4, start_timeout: float = 5.0) -> np.ndarray:
-        """Record audio with start/end chimes and automatic silence cutoff."""
+    def record_audio(self, max_duration: float = 12.0, silence_limit: float = 1.3, start_timeout: float = 4.0) -> np.ndarray:
+        """Record audio with OpenWhispr floating pill and animated waveform."""
         print("\n🎙️  Listening! Speak your command...")
-        self.play_chime("start")
+        if hasattr(self, "pill") and self.pill:
+            self.pill.set_state("recording")
+        else:
+            self.play_chime("start")
 
         frames = []
         silent_chunks = 0
@@ -637,6 +686,11 @@ class FastAgent:
             audio_data = np.frombuffer(data, dtype=np.int16)
             volume = np.abs(audio_data).mean()
 
+            # Live waveform update on floating pill
+            if hasattr(self, "pill") and self.pill:
+                norm = min(1.0, max(0.0, (volume - self.noise_floor) / max(600, self.speech_threshold - self.noise_floor + 200)))
+                self.pill.update_volume(norm)
+
             # Dynamic voice detection based on calibrated threshold
             if volume > self.speech_threshold:
                 talking_started = True
@@ -649,9 +703,16 @@ class FastAgent:
             if not talking_started and i > timeout_chunks:
                 break
 
-        self.play_chime("end")
-        if not frames:
+        if hasattr(self, "pill") and self.pill:
+            self.pill.set_state("processing")
+        else:
+            self.play_chime("end")
+
+        if not talking_started or not frames:
+            if hasattr(self, "pill") and self.pill:
+                self.pill.set_state("idle")
             return np.zeros(0, dtype=np.int16)
+
         return np.concatenate([np.frombuffer(f, dtype=np.int16) for f in frames])
 
     def transcribe(self, audio_data: np.ndarray) -> str:
