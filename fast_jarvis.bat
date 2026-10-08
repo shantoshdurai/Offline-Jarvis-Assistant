@@ -7,5 +7,5 @@ if exist venv\Scripts\activate.bat (
     call venv\Scripts\activate.bat
 )
 
-python fast_agent.py
-pause
+python fast_agent.py %*
+if not "%1"=="--minimized" pause

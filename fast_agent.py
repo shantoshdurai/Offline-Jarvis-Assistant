@@ -410,24 +410,71 @@ class FastAgent:
         except Exception:
             pass
 
+    def setup_tray(self):
+        """Setup Windows notification tray icon with controls."""
+        try:
+            import pystray
+            from PIL import Image, ImageDraw
+
+            def create_tray_image():
+                width, height = 64, 64
+                img = Image.new('RGBA', (width, height), (0, 0, 0, 0))
+                d = ImageDraw.Draw(img)
+                d.ellipse((6, 6, 58, 58), fill=(0, 200, 255, 255), outline=(255, 255, 255, 255), width=3)
+                d.ellipse((20, 20, 44, 44), fill=(255, 255, 255, 255))
+                return img
+
+            def on_trigger_voice(icon, item):
+                if not self.is_listening.is_set() and not self.is_speaking.is_set():
+                    self.is_listening.set()
+                    self.command_queue.put("HOTKEY")
+
+            def toggle_console(icon=None, item=None):
+                hwnd = ctypes.windll.kernel32.GetConsoleWindow()
+                if hwnd:
+                    is_visible = ctypes.windll.user32.IsWindowVisible(hwnd)
+                    ctypes.windll.user32.ShowWindow(hwnd, 0 if is_visible else 5)
+
+            def on_quit(icon, item):
+                icon.stop()
+                os._exit(0)
+
+            menu = pystray.Menu(
+                pystray.MenuItem('🎙️ Trigger Voice (Ctrl+Shift+Space)', on_trigger_voice),
+                pystray.MenuItem('Show / Hide Console (Ctrl+Alt+H)', toggle_console, default=True),
+                pystray.MenuItem('Quit Jarvis', on_quit)
+            )
+            self.tray_icon = pystray.Icon("JarvisFastAgent", create_tray_image(), "Jarvis AI (Ctrl+Shift+Space)", menu)
+            self.tray_icon.run()
+        except Exception:
+            pass
+
     def setup_hotkey(self):
-        """Set up push-to-talk hotkeys (Ctrl+Shift+Space and Ctrl+Alt+J)."""
+        """Set up push-to-talk hotkeys (Ctrl+Shift+Space, Ctrl+Alt+J) and console toggle (Ctrl+Alt+H)."""
         def on_hotkey():
             if not self.is_listening.is_set() and not self.is_speaking.is_set():
                 print("\n[Push-to-Talk Hotkey Triggered]")
                 self.is_listening.set()
                 self.command_queue.put("HOTKEY")
 
-        try:
-            self.hotkey_listener = keyboard.GlobalHotKeys({
-                '<ctrl>+<shift>+<space>': on_hotkey,
-                '<ctrl>+<alt>+j': on_hotkey,
-            })
-            self.hotkey_listener.daemon = True
-            self.hotkey_listener.start()
-            print("[OK] Push-to-talk active: Ctrl+Shift+Space or Ctrl+Alt+J")
-        except Exception as e:
-            print(f"[Warning] Hotkey setup: {e}")
+        def toggle_console():
+            hwnd = ctypes.windll.kernel32.GetConsoleWindow()
+            if hwnd:
+                is_visible = ctypes.windll.user32.IsWindowVisible(hwnd)
+                ctypes.windll.user32.ShowWindow(hwnd, 0 if is_visible else 5)
+
+        if keyboard is not None:
+            try:
+                self.hotkey_listener = keyboard.GlobalHotKeys({
+                    '<ctrl>+<shift>+<space>': on_hotkey,
+                    '<ctrl>+<alt>+j': on_hotkey,
+                    '<ctrl>+<alt>+h': toggle_console,
+                })
+                self.hotkey_listener.daemon = True
+                self.hotkey_listener.start()
+                print("[OK] Push-to-talk active: Ctrl+Shift+Space or Ctrl+Alt+J (Console toggle: Ctrl+Alt+H)")
+            except Exception as e:
+                print(f"[Warning] Hotkey setup: {e}")
 
     def tts_speak(self, text: str):
         """Neural speech output using Edge-TTS with instant Windows SAPI fallback."""
@@ -689,6 +736,16 @@ class FastAgent:
         print(" - Say 'Hey Jarvis' or press 'Ctrl+Shift+Space' / 'Ctrl+Alt+J'")
         print(" - Or type your command below and press Enter.")
         print("=" * 60 + "\n")
+
+        # Start system tray icon
+        tray_thread = threading.Thread(target=self.setup_tray, daemon=True)
+        tray_thread.start()
+
+        # Check if launched minimized/silent
+        if "--minimized" in sys.argv or "--silent" in sys.argv:
+            hwnd = ctypes.windll.kernel32.GetConsoleWindow()
+            if hwnd:
+                ctypes.windll.user32.ShowWindow(hwnd, 0)
 
         # Start wake word listener thread
         listener_thread = threading.Thread(target=self.wake_word_listener, daemon=True)

@@ -45,6 +45,16 @@ The Fast Agent is engineered for instant responsiveness with minimal latency and
    python fast_agent.py
    ```
 
+5. **Auto-Start on Boot & Shortcut Keys**:
+   - Double-click `enable_startup.bat` to have Jarvis launch silently into the system tray on every Windows boot.
+   - **Global Shortcuts (Active 24/7 anywhere in Windows)**:
+     - `Ctrl + Shift + Space` : Push-to-talk voice command (beeps, records, transcribes in <50ms, and responds).
+     - `Ctrl + Alt + J` : Secondary voice trigger / launcher shortcut.
+     - `Ctrl + Alt + H` : Show or hide the console window.
+     - `"Hey Jarvis"` : Hands-free wake word.
+     - System Tray Icon : Right-click by the clock to toggle console, trigger voice, or quit.
+   - To disable auto-start, double-click `disable_startup.bat`.
+
 ---
 
 ## 🛡️ 100% Offline Local Mode
