@@ -12,10 +12,11 @@ models/
 *.wav
 *.mp3
 
-# Secrets and config
+# Secrets, config, and local memory
 .env
 history.json
 config.json
+memory.json
 
 # Editor folders
 .vscode/

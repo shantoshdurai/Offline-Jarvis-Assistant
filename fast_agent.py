@@ -112,7 +112,10 @@ SYSTEM_PROMPT = """You are Jarvis, a fast personal voice AI assistant and pair p
 VOICE & TTS GUIDELINES:
 - Every word you output will be spoken aloud to the user via Text-to-Speech (TTS). Speak in 1-2 natural, conversational sentences.
 - NEVER include raw URLs (like https://...), query parameters, website links, slashes, or plus signs in spoken replies.
-- When asked to close an app, browser, tab, or window, ALWAYS call the close_app tool. NEVER dismiss yourself or go to sleep.
+- When asked to close an app, browser, tab, or window, ALWAYS call the close_app tool.
+- When asked to shut down, quit, exit, or stop Jarvis, call exit_jarvis. Never lecture about Terminator or give multi-paragraph options.
+- When asked to shut down the PC or computer, call system_control(action='shutdown_pc').
+- When told to remember facts or notes (e.g. preferences, project details), call save_memory. When asked what you remember, call recall_memory.
 - When asked to play music or videos, call play_video.
 - When asked to open apps, websites, or folders, call the appropriate tool.
 - When asked to run terminal commands, inspect files, or read code, use run_command, search_files, read_file, or list_folder_contents.
@@ -327,12 +330,74 @@ TOOL_DEFINITIONS = [
                 }
             }
         }
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "save_memory",
+            "description": "Store a user fact, preference, or note into persistent memory forever (e.g. 'remember that my favorite browser is Firefox', 'save note: project meeting at 3pm').",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "fact_or_note": {
+                        "type": "string",
+                        "description": "The fact, preference, or note to remember."
+                    }
+                },
+                "required": ["fact_or_note"]
+            }
+        }
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "recall_memory",
+            "description": "Recall stored facts, preferences, or notes from persistent memory (e.g. 'what is my preferred browser', 'what notes do you have', 'what did I tell you to remember').",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "query": {
+                        "type": "string",
+                        "description": "Keyword or topic to recall, or leave empty for general summary.",
+                        "default": ""
+                    }
+                }
+            }
+        }
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "forget_memory",
+            "description": "Forget or remove a specific fact or note from memory.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "target": {
+                        "type": "string",
+                        "description": "Fact or note to forget."
+                    }
+                },
+                "required": ["target"]
+            }
+        }
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "exit_jarvis",
+            "description": "Completely stop and shut down the Jarvis assistant application when the user asks to 'shut down jarvis', 'exit jarvis', 'quit jarvis', or 'stop jarvis'.",
+            "parameters": {
+                "type": "object",
+                "properties": {}
+            }
+        }
     }
 ]
 
 
-def dispatch_tool_call(name: str, args: Dict[str, Any]) -> str:
-    """Execute tool using tools.py implementation."""
+def dispatch_tool_call(name: str, args: Dict[str, Any], agent_ref: Optional[Any] = None) -> str:
+    """Execute tool using tools.py and memory_manager implementations."""
     try:
         if name == "play_video":
             return tools.play_video(args.get("query", ""), args.get("browser"))
@@ -356,6 +421,12 @@ def dispatch_tool_call(name: str, args: Dict[str, Any]) -> str:
             elif act == "lock":
                 ctypes.windll.user32.LockWorkStation()
                 return "Locked Windows workstation."
+            elif act in ("shutdown_pc", "shutdown_computer"):
+                subprocess.Popen(["shutdown", "/s", "/t", "60"])
+                return "Shutting down computer in 60 seconds. Say 'abort shutdown' to cancel."
+            elif act in ("abort_shutdown", "cancel_shutdown"):
+                subprocess.Popen(["shutdown", "/a"])
+                return "Computer shutdown cancelled."
             return f"Unknown system action: {act}"
         elif name == "run_command":
             return tools.execute_command(args.get("command", ""))
@@ -365,6 +436,19 @@ def dispatch_tool_call(name: str, args: Dict[str, Any]) -> str:
             return tools.read_file_content(args.get("file_path", ""))
         elif name == "list_folder_contents":
             return tools.list_folder_contents(args.get("folder_name", "downloads"))
+        elif name == "save_memory":
+            import memory_manager
+            return memory_manager.remember_fact_or_note(args.get("fact_or_note", ""))
+        elif name == "recall_memory":
+            import memory_manager
+            return memory_manager.recall_memories(args.get("query", ""))
+        elif name == "forget_memory":
+            import memory_manager
+            return memory_manager.forget_memory(args.get("target", ""))
+        elif name == "exit_jarvis":
+            if agent_ref:
+                threading.Thread(target=lambda: (time.sleep(1.2), agent_ref.shutdown()), daemon=True).start()
+            return "Shutting down Jarvis. Goodbye."
         else:
             return f"Unknown tool: {name}"
     except Exception as e:
@@ -803,6 +887,11 @@ class FastAgent:
 
     def query_llm(self, user_text: str) -> Tuple[str, List[Dict[str, Any]]]:
         """Query DeepSeek 4.1 Flash via OpenRouter with automatic zero-cost fallback."""
+        import memory_manager
+        mem_ctx = memory_manager.get_memory_context_string()
+        sys_content = SYSTEM_PROMPT + (f"\n\n{mem_ctx}" if mem_ctx else "")
+        self.history[0] = {"role": "system", "content": sys_content}
+
         self.history.append({"role": "user", "content": user_text})
 
         req_body = {
@@ -876,7 +965,7 @@ class FastAgent:
                 except Exception:
                     args = {}
                 print(f"⚡ [Tool]: {name}({args})")
-                res = dispatch_tool_call(name, args)
+                res = dispatch_tool_call(name, args, agent_ref=self)
                 tool_results.append(res)
                 executed_tool_name = name
 
@@ -974,7 +1063,7 @@ class FastAgent:
 
         clean = text.lower().strip(" .,?!\"'")
         words = clean.split()
-        if not words or len(words) > 7:
+        if not words or len(words) > 12:
             return False
 
         entity_guards = {
@@ -991,6 +1080,18 @@ class FastAgent:
         if any(w in action_guards for w in words):
             return False
 
+        # Phonetic STT mishearings of "terminate yourself"
+        if any(p in clean for p in ["terminator self", "terminate yourself", "terminal yourself", "terminate your self", "terminator yourself"]):
+            return True
+
+        # Goodbye / Bye endings (e.g. "no thanks for that bye bye", "thanks bye", "okay bye bye")
+        if clean.endswith("bye") or clean.endswith("bye bye") or clean.endswith("goodbye"):
+            return True
+
+        # Direct shutdown / turn off requests directed at Jarvis
+        if "shut down" in clean or "turn off" in clean:
+            return True
+
         exact_phrases = {
             "that's all", "thats all", "that is all",
             "that's all bye", "thats all bye", "that is all bye",
@@ -1005,9 +1106,9 @@ class FastAgent:
             return True
 
         patterns = [
-            r'^(?:ok\s+|okay\s+)?(?:that\'s\s+all|thats\s+all|that\s+is\s+all)(?:\s+bye)?(?:\s+jarvis)?(?:\s+for\s+now)?(?:\s+thank\s+you)?$',
-            r'^(?:ok\s+|okay\s+)?(?:bye|goodbye|bye\s+bye)(?:\s+jarvis)?(?:\s+for\s+now)?$',
-            r'^(?:go\s+to\s+sleep|sleep|terminate\s+yourself|dismiss\s+yourself|stop\s+listening)(?:\s+jarvis)?(?:\s+now)?$'
+            r'^(?:ok\s+|okay\s+|no\s+)?(?:thanks\s+|thank\s+you\s+)?(?:that\'s\s+all|thats\s+all|that\s+is\s+all)(?:\s+bye)?(?:\s+jarvis)?(?:\s+for\s+now)?$',
+            r'^(?:ok\s+|okay\s+|no\s+)?(?:thanks\s+|thank\s+you\s+)?(?:bye|goodbye|bye\s+bye)(?:\s+jarvis)?(?:\s+for\s+now)?$',
+            r'^(?:and\s+then\s+|i\s+want\s+you\s+to\s+|please\s+)?(?:go\s+to\s+sleep|sleep|shut\s+down|terminate\s+yourself|dismiss\s+yourself|stop\s+listening)(?:\s+jarvis)?(?:\s+now)?$'
         ]
         for pat in patterns:
             if re.match(pat, clean):
