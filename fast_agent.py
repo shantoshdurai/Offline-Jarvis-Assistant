@@ -38,6 +38,7 @@ except Exception:
     pass
 
 import time
+import re
 import json
 import queue
 import socket
@@ -108,10 +109,14 @@ except Exception:
 
 # Minimal lightweight system prompt for fastest response and low cold-start latency
 SYSTEM_PROMPT = """You are Jarvis, a fast personal voice AI assistant and pair programmer running on Windows.
-- Speak directly, concisely, and naturally (1-2 sentences for spoken replies).
-- When asked to play music or videos on YouTube, use play_video.
-- When asked to open apps, websites, folders, or adjust volume, use the appropriate tool.
-- Do not read out code blocks, markdown syntax, or long lists.
+VOICE & TTS GUIDELINES:
+- Every word you output will be spoken aloud to the user via Text-to-Speech (TTS). Speak in 1-2 natural, conversational sentences.
+- NEVER include raw URLs (like https://...), query parameters, website links, slashes, or plus signs in spoken replies.
+- When asked to close an app, browser, tab, or window, ALWAYS call the close_app tool. NEVER dismiss yourself or go to sleep.
+- When asked to play music or videos, call play_video.
+- When asked to open apps, websites, or folders, call the appropriate tool.
+- When asked to run terminal commands, inspect files, or read code, use run_command, search_files, read_file, or list_folder_contents.
+- Never read out code blocks, raw markdown, or long technical logs aloud.
 """
 
 TOOL_DEFINITIONS = [
@@ -148,6 +153,23 @@ TOOL_DEFINITIONS = [
                     "app_name": {
                         "type": "string",
                         "description": "Name of application."
+                    }
+                },
+                "required": ["app_name"]
+            }
+        }
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "close_app",
+            "description": "Close or terminate a running application, browser, or active window (e.g. 'close chrome', 'close firefox', 'close notepad', 'close window').",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "app_name": {
+                        "type": "string",
+                        "description": "Name or process of application to close (e.g. 'chrome', 'firefox', 'notepad', 'code', 'window')."
                     }
                 },
                 "required": ["app_name"]
@@ -288,6 +310,23 @@ TOOL_DEFINITIONS = [
                 "required": ["file_path"]
             }
         }
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "list_folder_contents",
+            "description": "List files and folders inside common directories or a specified directory (e.g. downloads, desktop, documents, project).",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "folder_name": {
+                        "type": "string",
+                        "description": "Folder to list: 'downloads', 'desktop', 'documents', 'project', or path.",
+                        "default": "downloads"
+                    }
+                }
+            }
+        }
     }
 ]
 
@@ -299,6 +338,8 @@ def dispatch_tool_call(name: str, args: Dict[str, Any]) -> str:
             return tools.play_video(args.get("query", ""), args.get("browser"))
         elif name == "open_app":
             return tools.open_app(args.get("app_name", ""))
+        elif name == "close_app":
+            return tools.close_app(args.get("app_name", ""))
         elif name == "open_url":
             return tools.open_url(args.get("url", ""), args.get("browser"))
         elif name == "open_leetcode":
@@ -322,6 +363,8 @@ def dispatch_tool_call(name: str, args: Dict[str, Any]) -> str:
             return tools.search_local_files(args.get("query", ""))
         elif name == "read_file":
             return tools.read_file_content(args.get("file_path", ""))
+        elif name == "list_folder_contents":
+            return tools.list_folder_contents(args.get("folder_name", "downloads"))
         else:
             return f"Unknown tool: {name}"
     except Exception as e:
@@ -343,6 +386,53 @@ def check_single_instance(port: int = IPC_PORT) -> bool:
         return True
     except (ConnectionRefusedError, OSError):
         return False
+
+
+def clean_spoken_text(text: str) -> str:
+    """Prepares text for natural human-like speech synthesis by removing URLs,
+    symbols, markdown syntax, and technical characters.
+    """
+    if not text:
+        return ""
+    s = text.strip()
+    # 1. Clean markdown code blocks, backticks, bold, headers, list bullets
+    s = re.sub(r'```[\s\S]*?```', '', s)
+    s = re.sub(r'`([^`]+)`', r'\1', s)
+    s = re.sub(r'(\*\*|\*|__|_|~~)', '', s)
+    s = re.sub(r'^#{1,6}\s+', '', s, flags=re.MULTILINE)
+    s = re.sub(r'^\s*[-*+]\s+', '', s, flags=re.MULTILINE)
+    s = re.sub(r'\[([^\]]+)\]\([^\)]+\)', r'\1', s)
+
+    # 2. Known sites -> conversational names
+    s = re.sub(r'https?://(?:www\.)?chatgpt\.com[^\s]*', 'ChatGPT', s, flags=re.IGNORECASE)
+    s = re.sub(r'https?://(?:www\.)?youtube\.com[^\s]*', 'YouTube', s, flags=re.IGNORECASE)
+    s = re.sub(r'https?://(?:www\.)?github\.com[^\s]*', 'GitHub', s, flags=re.IGNORECASE)
+    s = re.sub(r'https?://(?:www\.)?leetcode\.com[^\s]*', 'LeetCode', s, flags=re.IGNORECASE)
+    s = re.sub(r'https?://(?:www\.)?google\.com/search\?q=([^\s&]+)[^\s]*', lambda m: urllib.parse.unquote(m.group(1)).replace('+', ' '), s, flags=re.IGNORECASE)
+
+    # 3. Any remaining URLs -> convert to domain voice title
+    def clean_generic_url(match):
+        raw = match.group(0)
+        domain = re.sub(r'^https?://', '', raw, flags=re.IGNORECASE)
+        domain = re.sub(r'^www\.', '', domain, flags=re.IGNORECASE)
+        domain = domain.split('/')[0].split('?')[0]
+        voice_name = re.sub(r'\.(com|org|net|io|ai|co|gov|edu)$', '', domain, flags=re.IGNORECASE)
+        return voice_name.capitalize() if voice_name else 'the website'
+
+    s = re.sub(r'https?://[^\s]+', clean_generic_url, s)
+    s = re.sub(r'www\.[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}[^\s]*', clean_generic_url, s)
+
+    # 4. Clean query artifacts (+ between words) and multiple slashes
+    s = re.sub(r'(?<=\w)\+(?=\w)', ' ', s)
+    s = re.sub(r'/{2,}', ' ', s)
+    s = re.sub(r'\\{2,}', ' ', s)
+
+    # 5. Clean Windows paths to just filename or folder
+    s = re.sub(r'[A-Za-z]:\\[^ \n\r\t]+', lambda m: os.path.basename(m.group(0).rstrip('\\/')) or 'file', s)
+
+    # 6. Collapse spaces
+    s = re.sub(r'\s+', ' ', s).strip()
+    return s
 
 
 class FastAgent:
@@ -792,9 +882,12 @@ class FastAgent:
 
         spoken_response = content.strip()
         if not spoken_response and tool_results:
-            spoken_response = tool_results[0]
+            spoken_response = " ".join([r for r in tool_results if r])
         elif not spoken_response:
             spoken_response = "Done."
+
+        # Prepare clean speech for natural TTS voice delivery
+        cleaned_speech = clean_spoken_text(spoken_response)
 
         self.history.append({"role": "assistant", "content": spoken_response})
 
@@ -809,14 +902,14 @@ class FastAgent:
         if self.pill:
             self.pill.set_state("speaking")
 
-        self.tts_speak(spoken_response)
+        self.tts_speak(cleaned_speech)
 
     def tts_speak(self, text: str):
         """Neural Edge-TTS speech with instant offline SAPI fallback."""
-        if not text.strip():
+        clean_text = clean_spoken_text(text)
+        if not clean_text:
             return
 
-        clean_text = text.replace("```", "").replace("**", "").replace("*", "").strip()
         self.is_speaking.set()
 
         temp_audio = os.path.join(
@@ -873,23 +966,51 @@ class FastAgent:
                     self.pill.set_state("idle")
 
     def is_dismissal_command(self, text: str) -> bool:
-        """Detect natural voice sleep / dismissal commands."""
+        """Detect natural voice sleep / dismissal commands for Jarvis itself.
+        Never triggers if user is referring to an application, window, tab, or file.
+        """
         if not self.voice_dismissal_enabled:
             return False
+
         clean = text.lower().strip(" .,?!\"'")
-        dismissal_phrases = [
+        words = clean.split()
+        if not words or len(words) > 7:
+            return False
+
+        entity_guards = {
+            "chrome", "firefox", "edge", "browser", "window", "tab", "tabs",
+            "app", "application", "file", "files", "folder", "download", "downloads",
+            "youtube", "video", "music", "song", "screen", "process", "program",
+            "code", "terminal", "powershell", "cmd", "notepad", "calculator", "calc",
+            "spotify", "blender", "pc", "laptop", "computer"
+        }
+        if any(w in entity_guards for w in words):
+            return False
+
+        action_guards = {"open", "play", "search", "show", "read", "run", "launch", "kill", "find", "check"}
+        if any(w in action_guards for w in words):
+            return False
+
+        exact_phrases = {
             "that's all", "thats all", "that is all",
-            "bye", "goodbye", "ok bye", "okay bye", "bye bye",
-            "terminate yourself", "terminate",
-            "go to sleep", "sleep",
-            "close", "quit", "stop listening", "dismiss", "cancel"
+            "that's all bye", "thats all bye", "that is all bye",
+            "that's all for now", "thats all for now", "that is all for now",
+            "that will be all", "thats everything", "that's everything",
+            "bye", "goodbye", "bye bye", "ok bye", "okay bye", "bye jarvis", "goodbye jarvis",
+            "go to sleep", "sleep now", "sleep jarvis",
+            "terminate yourself", "dismiss yourself", "stop listening",
+            "dismiss", "stand by", "stand down", "sleep"
+        }
+        if clean in exact_phrases:
+            return True
+
+        patterns = [
+            r'^(?:ok\s+|okay\s+)?(?:that\'s\s+all|thats\s+all|that\s+is\s+all)(?:\s+bye)?(?:\s+jarvis)?(?:\s+for\s+now)?(?:\s+thank\s+you)?$',
+            r'^(?:ok\s+|okay\s+)?(?:bye|goodbye|bye\s+bye)(?:\s+jarvis)?(?:\s+for\s+now)?$',
+            r'^(?:go\s+to\s+sleep|sleep|terminate\s+yourself|dismiss\s+yourself|stop\s+listening)(?:\s+jarvis)?(?:\s+now)?$'
         ]
-        for phrase in dismissal_phrases:
-            if clean == phrase:
-                return True
-            if clean.startswith(phrase + " ") or clean.endswith(" " + phrase):
-                return True
-            if phrase in clean and ("bye" in phrase or "all" in phrase or "terminate" in phrase or "sleep" in phrase):
+        for pat in patterns:
+            if re.match(pat, clean):
                 return True
         return False
 

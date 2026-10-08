@@ -67,7 +67,32 @@ def play_video(query_or_target, browser=None):
             return f"Playing '{cleaned_query}' on YouTube in Chrome."
 
     webbrowser.open(target_url)
-    return f"Playing '{cleaned_query}' on YouTube: {target_url}"
+    return f"Playing '{cleaned_query}' on YouTube."
+
+def get_friendly_site_name(url: str, raw_target: str) -> str:
+    """Extracts a clean, voice-friendly description of what was opened."""
+    url_lower = url.lower()
+    if "chatgpt.com" in url_lower:
+        return "ChatGPT"
+    elif "youtube.com" in url_lower:
+        return "YouTube"
+    elif "github.com" in url_lower:
+        return "GitHub"
+    elif "leetcode.com" in url_lower:
+        return "LeetCode"
+    elif "google.com/search?q=" in url_lower:
+        q = urllib.parse.unquote(url.split("search_query=")[-1] if "search_query=" in url else url.split("q=")[-1])
+        q = q.replace("+", " ").strip()
+        return f"search for '{q}'"
+    elif "reddit.com" in url_lower:
+        return "Reddit"
+    elif "twitter.com" in url_lower or "x.com" in url_lower:
+        return "X"
+    elif "wikipedia.org" in url_lower:
+        return "Wikipedia"
+    else:
+        raw_clean = raw_target.replace("http://", "").replace("https://", "").replace("www.", "").strip("/")
+        return raw_clean or "the webpage"
 
 def open_url(url_or_target, browser=None):
     """Opens a website or URL in Firefox, Chrome, or default browser."""
@@ -89,20 +114,21 @@ def open_url(url_or_target, browser=None):
         else:
             url = f"https://www.google.com/search?q={urllib.parse.quote(url)}"
 
+    friendly_name = get_friendly_site_name(url, url_or_target)
     browser_lower = (browser or "").lower()
     if "firefox" in browser_lower:
         ff = get_firefox_exe()
         if ff:
             subprocess.Popen([ff, url])
-            return f"Opened {url} in Firefox."
+            return f"Opened {friendly_name} in Firefox."
     elif "chrome" in browser_lower:
         ch = get_chrome_exe()
         if ch:
             subprocess.Popen([ch, url])
-            return f"Opened {url} in Chrome."
+            return f"Opened {friendly_name} in Chrome."
 
     webbrowser.open(url)
-    return f"Opened {url} in your default browser."
+    return f"Opened {friendly_name}."
 
 def get_leetcode_daily():
     """Queries LeetCode public GraphQL API for today's active coding challenge."""
@@ -269,6 +295,72 @@ def open_app(app_name):
     else:
         subprocess.Popen(["start", app_name], shell=True)
         return f"Attempted to open application: {app_name}"
+
+def close_app(app_name):
+    """Closes or terminates a running application, browser, or active window."""
+    name = (app_name or "").strip().strip("'\"").lower()
+    if not name:
+        return "Please specify the application to close."
+
+    targets = []
+    display_name = app_name
+
+    if "chrome" in name:
+        targets = ["chrome.exe"]
+        display_name = "Google Chrome"
+    elif "firefox" in name:
+        targets = ["firefox.exe"]
+        display_name = "Mozilla Firefox"
+    elif "edge" in name:
+        targets = ["msedge.exe"]
+        display_name = "Microsoft Edge"
+    elif "code" in name or "vscode" in name:
+        targets = ["Code.exe"]
+        display_name = "Visual Studio Code"
+    elif "notepad" in name:
+        targets = ["notepad.exe"]
+        display_name = "Notepad"
+    elif "calc" in name or "calculator" in name:
+        targets = ["CalculatorApp.exe", "calc.exe"]
+        display_name = "Calculator"
+    elif "spotify" in name:
+        targets = ["Spotify.exe"]
+        display_name = "Spotify"
+    elif "blender" in name:
+        targets = ["blender.exe"]
+        display_name = "Blender"
+    elif "terminal" in name or "powershell" in name:
+        targets = ["WindowsTerminal.exe", "powershell.exe"]
+        display_name = "Terminal"
+    elif "cmd" in name or "command prompt" in name:
+        targets = ["cmd.exe"]
+        display_name = "Command Prompt"
+    elif any(k in name for k in ("current", "active", "this window", "the window", "that window")):
+        import ctypes
+        VK_MENU = 0x12  # Alt
+        VK_F4 = 0x73    # F4
+        ctypes.windll.user32.keybd_event(VK_MENU, 0, 0, 0)
+        ctypes.windll.user32.keybd_event(VK_F4, 0, 0, 0)
+        ctypes.windll.user32.keybd_event(VK_F4, 0, 2, 0)
+        ctypes.windll.user32.keybd_event(VK_MENU, 0, 2, 0)
+        return "Closed the active window."
+    else:
+        proc = name if name.endswith(".exe") else f"{name}.exe"
+        targets = [proc]
+        display_name = app_name
+
+    closed_any = False
+    for exe in targets:
+        try:
+            res = subprocess.run(["taskkill", "/F", "/IM", exe, "/T"], capture_output=True, text=True)
+            if res.returncode == 0:
+                closed_any = True
+        except Exception:
+            pass
+
+    if closed_any:
+        return f"Closed {display_name}."
+    return f"{display_name} was closed or not running."
 
 def take_screenshot(filename=None):
     """Takes a desktop screenshot and saves it."""
