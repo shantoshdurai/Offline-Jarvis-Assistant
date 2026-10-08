@@ -15,6 +15,7 @@ models/
 # Secrets and config
 .env
 history.json
+config.json
 
 # Editor folders
 .vscode/

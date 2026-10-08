@@ -50,6 +50,36 @@ def save_history(history: List[Dict[str, Any]]):
         pass
 
 
+CONFIG_FILE = os.path.join(BASE_DIR, "config.json")
+
+DEFAULT_CONFIG = {
+    "follow_up_timeout": 10.0,
+    "silence_limit": 0.55,
+    "sfx_enabled": True,
+    "voice_dismissal_enabled": True,
+    "wake_word_enabled": True,
+}
+
+
+def load_config() -> Dict[str, Any]:
+    cfg = DEFAULT_CONFIG.copy()
+    if os.path.exists(CONFIG_FILE):
+        try:
+            with open(CONFIG_FILE, "r", encoding="utf-8") as f:
+                cfg.update(json.load(f))
+        except Exception:
+            pass
+    return cfg
+
+
+def save_config(cfg: Dict[str, Any]):
+    try:
+        with open(CONFIG_FILE, "w", encoding="utf-8") as f:
+            json.dump(cfg, f, indent=2)
+    except Exception:
+        pass
+
+
 class JarvisDashboard:
     def __init__(
         self,
@@ -58,13 +88,16 @@ class JarvisDashboard:
         on_stop_jarvis: Optional[Callable[[], None]] = None,
         on_save_api_key: Optional[Callable[[str], None]] = None,
         on_toggle_wake_word: Optional[Callable[[bool], None]] = None,
+        on_update_settings: Optional[Callable[[Dict[str, Any]], None]] = None,
     ):
         self.on_trigger_voice = on_trigger_voice
         self.on_send_chat = on_send_chat
         self.on_stop_jarvis = on_stop_jarvis
         self.on_save_api_key = on_save_api_key
         self.on_toggle_wake_word = on_toggle_wake_word
+        self.on_update_settings = on_update_settings
 
+        self.config = load_config()
         self.history = load_history()
         self.current_view = "home"
 
@@ -674,42 +707,131 @@ class JarvisDashboard:
         self.views["settings"] = settings_frame
         settings_frame.grid_columnconfigure(0, weight=1)
 
-        # Section 1: Hotkeys & Trigger
-        s1 = self._create_settings_section(settings_frame, "Push-to-Talk & Hotkeys")
+        # Section 1: Voice Session & Follow-Up Listening
+        s1 = self._create_settings_section(settings_frame, "Voice Conversation & Listening Window")
 
+        # Row 1: Follow-up timeout
         row1 = ctk.CTkFrame(s1, fg_color="transparent")
-        row1.pack(fill="x", padx=14, pady=8)
-        ctk.CTkLabel(row1, text="Push-to-Talk Shortcuts:", font=ctk.CTkFont(size=12, weight="bold"), text_color="#f8fafc").pack(side="left")
-        ctk.CTkLabel(row1, text="Ctrl+Shift+Space  |  Ctrl+Alt+J  |  Ctrl+Win", font=ctk.CTkFont(size=12), text_color="#38bdf8").pack(side="right")
+        row1.pack(fill="x", padx=14, pady=(8, 2))
+        ctk.CTkLabel(row1, text="Follow-Up Listening Window:", font=ctk.CTkFont(size=12, weight="bold"), text_color="#f8fafc").pack(side="left")
+        
+        curr_timeout_str = f"{int(self.config.get('follow_up_timeout', 10))}s"
+        self.timeout_seg = ctk.CTkSegmentedButton(
+            row1,
+            values=["5s", "10s", "15s", "20s", "30s"],
+            command=self._on_timeout_change,
+            selected_color="#2563eb",
+            height=28
+        )
+        self.timeout_seg.set(curr_timeout_str)
+        self.timeout_seg.pack(side="right")
 
+        ctk.CTkLabel(
+            s1,
+            text="Keeps mic open for follow-up questions without needing the hotkey again.",
+            font=ctk.CTkFont(size=10),
+            text_color="#64748b"
+        ).pack(anchor="w", padx=14, pady=(0, 8))
+
+        # Row 2: Silence limit (Endpointing)
         row2 = ctk.CTkFrame(s1, fg_color="transparent")
-        row2.pack(fill="x", padx=14, pady=8)
-        ctk.CTkLabel(row2, text="Wake Word ('Hey Jarvis'):", font=ctk.CTkFont(size=12, weight="bold"), text_color="#f8fafc").pack(side="left")
-        self.wake_switch = ctk.CTkSwitch(row2, text="Active", command=self._toggle_wake)
-        self.wake_switch.select()
+        row2.pack(fill="x", padx=14, pady=(6, 2))
+        ctk.CTkLabel(row2, text="Silence Cutoff Speed:", font=ctk.CTkFont(size=12, weight="bold"), text_color="#f8fafc").pack(side="left")
+
+        curr_silence = self.config.get("silence_limit", 0.55)
+        curr_silence_str = f"{curr_silence:.2f}s" if curr_silence in (0.4, 0.55, 0.8, 1.2) else "0.55s"
+        self.silence_seg = ctk.CTkSegmentedButton(
+            row2,
+            values=["0.40s", "0.55s", "0.80s", "1.20s"],
+            command=self._on_silence_change,
+            selected_color="#2563eb",
+            height=28
+        )
+        self.silence_seg.set(curr_silence_str)
+        self.silence_seg.pack(side="right")
+
+        ctk.CTkLabel(
+            s1,
+            text="How quickly Jarvis detects you finished speaking and begins transcription.",
+            font=ctk.CTkFont(size=10),
+            text_color="#64748b"
+        ).pack(anchor="w", padx=14, pady=(0, 8))
+
+        # Row 3: Sound Effects (Wake/Sleep Chimes)
+        row3 = ctk.CTkFrame(s1, fg_color="transparent")
+        row3.pack(fill="x", padx=14, pady=(6, 2))
+        ctk.CTkLabel(row3, text="Audio Chimes (Wake / Sleep SFX):", font=ctk.CTkFont(size=12, weight="bold"), text_color="#f8fafc").pack(side="left")
+        self.sfx_switch = ctk.CTkSwitch(row3, text="Enabled", command=self._on_sfx_toggle)
+        if self.config.get("sfx_enabled", True):
+            self.sfx_switch.select()
+        else:
+            self.sfx_switch.deselect()
+        self.sfx_switch.pack(side="right")
+
+        ctk.CTkLabel(
+            s1,
+            text="Plays C5->E5 chime when waking, and D5->A4 sleep chime when entering standby.",
+            font=ctk.CTkFont(size=10),
+            text_color="#64748b"
+        ).pack(anchor="w", padx=14, pady=(0, 8))
+
+        # Row 4: Voice Dismissal Commands
+        row4 = ctk.CTkFrame(s1, fg_color="transparent")
+        row4.pack(fill="x", padx=14, pady=(6, 2))
+        ctk.CTkLabel(row4, text="Voice Sleep Commands:", font=ctk.CTkFont(size=12, weight="bold"), text_color="#f8fafc").pack(side="left")
+        self.dismissal_switch = ctk.CTkSwitch(row4, text="Active", command=self._on_dismissal_toggle)
+        if self.config.get("voice_dismissal_enabled", True):
+            self.dismissal_switch.select()
+        else:
+            self.dismissal_switch.deselect()
+        self.dismissal_switch.pack(side="right")
+
+        ctk.CTkLabel(
+            s1,
+            text="Say 'that's all bye', 'terminate yourself', or 'close' to put Jarvis to sleep immediately.",
+            font=ctk.CTkFont(size=10),
+            text_color="#64748b"
+        ).pack(anchor="w", padx=14, pady=(0, 12))
+
+        # Section 2: Hotkeys & Wake Word
+        s2 = self._create_settings_section(settings_frame, "Push-to-Talk & Wake Word")
+
+        row_hk = ctk.CTkFrame(s2, fg_color="transparent")
+        row_hk.pack(fill="x", padx=14, pady=8)
+        ctk.CTkLabel(row_hk, text="Push-to-Talk Shortcuts:", font=ctk.CTkFont(size=12, weight="bold"), text_color="#f8fafc").pack(side="left")
+        ctk.CTkLabel(row_hk, text="Ctrl+Shift+Space  |  Ctrl+Alt+J  |  Ctrl+Win", font=ctk.CTkFont(size=12), text_color="#38bdf8").pack(side="right")
+
+        row_ww = ctk.CTkFrame(s2, fg_color="transparent")
+        row_ww.pack(fill="x", padx=14, pady=8)
+        ctk.CTkLabel(row_ww, text="Wake Word ('Hey Jarvis'):", font=ctk.CTkFont(size=12, weight="bold"), text_color="#f8fafc").pack(side="left")
+        self.wake_switch = ctk.CTkSwitch(row_ww, text="Active", command=self._toggle_wake)
+        if self.config.get("wake_word_enabled", True):
+            self.wake_switch.select()
+        else:
+            self.wake_switch.deselect()
         self.wake_switch.pack(side="right")
 
-        # Section 2: AI Models & API Key
-        s2 = self._create_settings_section(settings_frame, "AI Model & OpenRouter API")
+        # Section 3: AI Models & API Key
+        s3 = self._create_settings_section(settings_frame, "AI Model & OpenRouter API")
 
-        row3 = ctk.CTkFrame(s2, fg_color="transparent")
-        row3.pack(fill="x", padx=14, pady=8)
-        ctk.CTkLabel(row3, text="Primary LLM:", font=ctk.CTkFont(size=12, weight="bold"), text_color="#f8fafc").pack(side="left")
-        ctk.CTkLabel(row3, text="DeepSeek 4.1 Flash (Auto-Fallback: openrouter/free)", font=ctk.CTkFont(size=12), text_color="#94a3b8").pack(side="right")
+        row_m1 = ctk.CTkFrame(s3, fg_color="transparent")
+        row_m1.pack(fill="x", padx=14, pady=8)
+        ctk.CTkLabel(row_m1, text="Primary LLM:", font=ctk.CTkFont(size=12, weight="bold"), text_color="#f8fafc").pack(side="left")
+        ctk.CTkLabel(row_m1, text="DeepSeek 4.1 Flash (Auto-Fallback: openrouter/free)", font=ctk.CTkFont(size=12), text_color="#94a3b8").pack(side="right")
 
-        row4 = ctk.CTkFrame(s2, fg_color="transparent")
-        row4.pack(fill="x", padx=14, pady=8)
-        ctk.CTkLabel(row4, text="Speech STT Engine:", font=ctk.CTkFont(size=12, weight="bold"), text_color="#f8fafc").pack(side="left")
-        ctk.CTkLabel(row4, text="NVIDIA Parakeet-EOU INT8 (Sub-50ms)", font=ctk.CTkFont(size=12), text_color="#10b981").pack(side="right")
+        row_m2 = ctk.CTkFrame(s3, fg_color="transparent")
+        row_m2.pack(fill="x", padx=14, pady=8)
+        ctk.CTkLabel(row_m2, text="Speech STT Engine:", font=ctk.CTkFont(size=12, weight="bold"), text_color="#f8fafc").pack(side="left")
+        ctk.CTkLabel(row_m2, text="NVIDIA Parakeet-EOU INT8 (Sub-50ms + Silence Trim)", font=ctk.CTkFont(size=12), text_color="#10b981").pack(side="right")
 
-        row5 = ctk.CTkFrame(s2, fg_color="transparent")
-        row5.pack(fill="x", padx=14, pady=(8, 14))
-        ctk.CTkLabel(row5, text="OpenRouter Key:", font=ctk.CTkFont(size=12, weight="bold"), text_color="#f8fafc").pack(side="left")
+        row_key = ctk.CTkFrame(s3, fg_color="transparent")
+        row_key.pack(fill="x", padx=14, pady=(8, 14))
+        ctk.CTkLabel(row_key, text="OpenRouter Key:", font=ctk.CTkFont(size=12, weight="bold"), text_color="#f8fafc").pack(side="left")
 
         current_key = os.getenv("OPENROUTER_API_KEY", "")
         masked_key = (current_key[:8] + "..." + current_key[-6:]) if len(current_key) > 14 else current_key
         self.key_entry = ctk.CTkEntry(
-            row5,
+            row_key,
             placeholder_text=masked_key or "Enter sk-or-v1-...",
             fg_color="#161720",
             border_color="#232532",
@@ -720,7 +842,7 @@ class JarvisDashboard:
         self.key_entry.pack(side="right", padx=(8, 0))
 
         save_key_btn = ctk.CTkButton(
-            row5,
+            row_key,
             text="Save",
             width=60,
             height=32,
@@ -750,10 +872,48 @@ class JarvisDashboard:
         t_lbl.pack(anchor="w", padx=14, pady=(10, 4))
         return container
 
+    def _on_timeout_change(self, value: str):
+        try:
+            val = float(value.replace("s", ""))
+            self.config["follow_up_timeout"] = val
+            save_config(self.config)
+            if self.on_update_settings:
+                self.on_update_settings(self.config)
+        except Exception:
+            pass
+
+    def _on_silence_change(self, value: str):
+        try:
+            val = float(value.replace("s", ""))
+            self.config["silence_limit"] = val
+            save_config(self.config)
+            if self.on_update_settings:
+                self.on_update_settings(self.config)
+        except Exception:
+            pass
+
+    def _on_sfx_toggle(self):
+        state = bool(self.sfx_switch.get())
+        self.config["sfx_enabled"] = state
+        save_config(self.config)
+        if self.on_update_settings:
+            self.on_update_settings(self.config)
+
+    def _on_dismissal_toggle(self):
+        state = bool(self.dismissal_switch.get())
+        self.config["voice_dismissal_enabled"] = state
+        save_config(self.config)
+        if self.on_update_settings:
+            self.on_update_settings(self.config)
+
     def _toggle_wake(self):
         state = bool(self.wake_switch.get())
+        self.config["wake_word_enabled"] = state
+        save_config(self.config)
         if self.on_toggle_wake_word:
             self.on_toggle_wake_word(state)
+        if self.on_update_settings:
+            self.on_update_settings(self.config)
 
     def _save_key(self):
         val = self.key_entry.get().strip()

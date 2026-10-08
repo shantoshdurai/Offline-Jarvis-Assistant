@@ -77,7 +77,7 @@ except ImportError:
 import tools
 from parakeet_stt import ParakeetEOU
 from overlay_widget import FloatingVoicePill
-from dashboard_gui import JarvisDashboard
+from dashboard_gui import JarvisDashboard, load_config, save_config
 
 # Base directories & environment
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
@@ -352,7 +352,15 @@ class FastAgent:
         print("============================================================\n")
 
         self.is_running = True
-        self.wake_word_enabled = True
+        self.is_session_active = False
+
+        # Load persistent configuration
+        self.config = load_config()
+        self.follow_up_timeout = float(self.config.get("follow_up_timeout", 10.0))
+        self.silence_limit = float(self.config.get("silence_limit", 0.55))
+        self.sfx_enabled = bool(self.config.get("sfx_enabled", True))
+        self.voice_dismissal_enabled = bool(self.config.get("voice_dismissal_enabled", True))
+        self.wake_word_enabled = bool(self.config.get("wake_word_enabled", True))
 
         # 1. Initialize Dashboard GUI
         self.dashboard = JarvisDashboard(
@@ -361,11 +369,13 @@ class FastAgent:
             on_stop_jarvis=self.shutdown,
             on_save_api_key=self.save_api_key,
             on_toggle_wake_word=self.set_wake_word_enabled,
+            on_update_settings=self.on_update_settings,
         )
 
         # 2. OpenWhispr Floating Voice Pill Overlay (attached to CTk root)
         try:
             self.pill = FloatingVoicePill(parent=self.dashboard.root)
+            self.pill.sfx_enabled = self.sfx_enabled
             print("[OK] OpenWhispr Floating Voice Pill overlay active")
         except Exception as e:
             print(f"[Notice] Floating overlay error: {e}")
@@ -451,6 +461,20 @@ class FastAgent:
 
     def set_wake_word_enabled(self, enabled: bool):
         self.wake_word_enabled = enabled
+        self.config["wake_word_enabled"] = enabled
+        save_config(self.config)
+
+    def on_update_settings(self, new_cfg: Dict[str, Any]):
+        self.config.update(new_cfg)
+        self.follow_up_timeout = float(self.config.get("follow_up_timeout", 10.0))
+        self.silence_limit = float(self.config.get("silence_limit", 0.55))
+        self.sfx_enabled = bool(self.config.get("sfx_enabled", True))
+        if self.pill:
+            self.pill.sfx_enabled = self.sfx_enabled
+        self.voice_dismissal_enabled = bool(self.config.get("voice_dismissal_enabled", True))
+        self.wake_word_enabled = bool(self.config.get("wake_word_enabled", True))
+        save_config(self.config)
+        print(f"[Settings Updated] FollowUp={self.follow_up_timeout}s | SilenceLimit={self.silence_limit}s | SFX={self.sfx_enabled} | Dismissal={self.voice_dismissal_enabled}")
 
     def save_api_key(self, key: str):
         global OPENROUTER_API_KEY
@@ -572,19 +596,20 @@ class FastAgent:
 
     def trigger_voice(self):
         """Triggers push-to-talk voice recording."""
-        if not self.is_listening.is_set() and not self.is_speaking.is_set():
-            self.is_listening.set()
+        if not self.is_speaking.is_set() and not self.is_session_active:
             self.command_queue.put("TRIGGER")
 
-    def play_chime(self, cue_type: str = "start"):
-        """Plays OpenWhispr harmonic chime."""
+    def play_chime(self, cue_type: str = "wake"):
+        """Plays OpenWhispr harmonic chime (wake: C5->E5, sleep: D5->A4)."""
+        if not self.sfx_enabled:
+            return
         if self.pill:
             self.pill.play_sfx(cue_type)
         else:
             try:
-                if cue_type == "start":
+                if cue_type in ("wake", "start"):
                     winsound.MessageBeep(winsound.MB_ICONASTERISK)
-                else:
+                elif cue_type in ("sleep", "stop"):
                     winsound.MessageBeep(winsound.MB_OK)
             except Exception:
                 pass
@@ -595,12 +620,12 @@ class FastAgent:
             self.whisper_model = WhisperModel("base.en", device="cpu", compute_type="int8")
         return self.whisper_model
 
-    def record_audio(self, max_duration: float = 12.0, silence_limit: float = 1.3, start_timeout: float = 4.0) -> np.ndarray:
+    def record_audio(self, max_duration: float = 12.0, silence_limit: Optional[float] = None, start_timeout: Optional[float] = None) -> np.ndarray:
         """Records voice with live waveform equalizer on floating pill."""
-        if self.pill:
-            self.pill.set_state("recording")
-        else:
-            self.play_chime("start")
+        if silence_limit is None:
+            silence_limit = self.silence_limit
+        if start_timeout is None:
+            start_timeout = self.follow_up_timeout
 
         frames = []
         silent_chunks = 0
@@ -627,7 +652,10 @@ class FastAgent:
                 self.pill.update_volume(norm)
 
             if volume > self.speech_threshold:
-                talking_started = True
+                if not talking_started:
+                    talking_started = True
+                    if self.pill:
+                        self.pill.set_state("recording")
                 silent_chunks = 0
             elif talking_started:
                 silent_chunks += 1
@@ -637,14 +665,7 @@ class FastAgent:
             if not talking_started and i > timeout_chunks:
                 break
 
-        if self.pill:
-            self.pill.set_state("processing")
-        else:
-            self.play_chime("stop")
-
         if not talking_started or not frames:
-            if self.pill:
-                self.pill.set_state("idle")
             return np.zeros(0, dtype=np.int16)
 
         return np.concatenate([np.frombuffer(f, dtype=np.int16) for f in frames])
@@ -846,7 +867,92 @@ class FastAgent:
                     break
             self.is_speaking.clear()
             if self.pill:
-                self.pill.set_state("idle")
+                if self.is_session_active:
+                    self.pill.set_state("listening")
+                else:
+                    self.pill.set_state("idle")
+
+    def is_dismissal_command(self, text: str) -> bool:
+        """Detect natural voice sleep / dismissal commands."""
+        if not self.voice_dismissal_enabled:
+            return False
+        clean = text.lower().strip(" .,?!\"'")
+        dismissal_phrases = [
+            "that's all", "thats all", "that is all",
+            "bye", "goodbye", "ok bye", "okay bye", "bye bye",
+            "terminate yourself", "terminate",
+            "go to sleep", "sleep",
+            "close", "quit", "stop listening", "dismiss", "cancel"
+        ]
+        for phrase in dismissal_phrases:
+            if clean == phrase:
+                return True
+            if clean.startswith(phrase + " ") or clean.endswith(" " + phrase):
+                return True
+            if phrase in clean and ("bye" in phrase or "all" in phrase or "terminate" in phrase or "sleep" in phrase):
+                return True
+        return False
+
+    def handle_conversation_session(self):
+        """Active conversational session loop.
+        Listens, responds, and remains open for follow-up questions
+        for up to follow_up_timeout seconds (default 10s) before going to sleep.
+        """
+        self.is_session_active = True
+        self.is_listening.set()
+
+        # Play wake chime ONCE when session begins
+        if self.sfx_enabled:
+            self.play_chime("wake")
+
+        # Initial turn timeout
+        current_timeout = max(5.0, self.follow_up_timeout)
+
+        while self.is_running and self.is_session_active:
+            if self.pill:
+                self.pill.set_state("listening")
+
+            audio_data = self.record_audio(
+                max_duration=12.0,
+                silence_limit=self.silence_limit,
+                start_timeout=current_timeout
+            )
+
+            if len(audio_data) == 0:
+                print(f"[Session idle for {current_timeout:.1f}s -> Entering standby sleep]")
+                break
+
+            if self.pill:
+                self.pill.set_state("processing")
+
+            user_text = self.transcribe(audio_data)
+            clean_text = user_text.lower().strip(" .,?!\"'")
+
+            if not clean_text or clean_text in ("", "mmhm", "mhm", "uh", "um", "ah", "hm", "huh"):
+                continue
+
+            # Voice dismissal / sleep check
+            if self.is_dismissal_command(clean_text):
+                print(f"[Voice Dismissal: '{user_text}'] -> Entering standby sleep")
+                self.dashboard.add_interaction(user_text, "Standing by.", source="voice", tool="sleep")
+                if self.pill:
+                    self.pill.set_state("speaking")
+                self.tts_speak("Standing by.")
+                break
+
+            # Execute normal command
+            self.execute_command_pipeline(user_text, source="voice")
+
+            # After response, keep session open for follow_up_timeout (default 10s)
+            current_timeout = self.follow_up_timeout
+
+        # Terminate session & enter standby sleep
+        self.is_session_active = False
+        if self.pill:
+            self.pill.set_state("idle")
+        if self.sfx_enabled:
+            self.play_chime("sleep")
+        self.is_listening.clear()
 
     def _wake_word_listener(self):
         """Continuous mic listening for 'Hey Jarvis'."""
@@ -855,7 +961,7 @@ class FastAgent:
 
         while self.is_running:
             try:
-                if self.wake_word_enabled and not self.is_listening.is_set() and not self.is_speaking.is_set():
+                if self.wake_word_enabled and not self.is_listening.is_set() and not self.is_speaking.is_set() and not self.is_session_active:
                     data = self.mic_stream.read(CHUNK, exception_on_overflow=False)
                     audio_data = np.frombuffer(data, dtype=np.int16)
                     prediction = self.oww.predict(audio_data)
@@ -882,16 +988,7 @@ class FastAgent:
                 continue
 
             if trigger == "TRIGGER":
-                audio_data = self.record_audio()
-                self.is_listening.clear()
-
-                if len(audio_data) > 0:
-                    user_text = self.transcribe(audio_data)
-                    if user_text:
-                        self.execute_command_pipeline(user_text, source="voice")
-                else:
-                    if self.pill:
-                        self.pill.set_state("idle")
+                self.handle_conversation_session()
 
     def _terminal_input_loop(self):
         """Console keyboard input loop when --console is active."""

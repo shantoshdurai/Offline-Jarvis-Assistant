@@ -67,6 +67,22 @@ def compute_mel_spectrogram(samples: np.ndarray) -> np.ndarray:
     return mel.T  # [128, n_frames]
 
 
+def trim_trailing_silence(audio: np.ndarray, threshold: float = 0.012, min_keep: int = 8000) -> np.ndarray:
+    """Trim trailing dead silence chunks from audio to minimize decode frames."""
+    if len(audio) <= min_keep:
+        return audio
+    chunk_size = 320  # 20ms at 16kHz
+    n = len(audio) // chunk_size
+    last_voice = n
+    for i in range(n - 1, -1, -1):
+        seg = audio[i * chunk_size : (i + 1) * chunk_size]
+        if np.abs(seg).mean() > threshold:
+            last_voice = min(n, i + 3)  # keep 60ms cushion
+            break
+    end_idx = max(min_keep, last_voice * chunk_size)
+    return audio[:end_idx]
+
+
 class ParakeetEOU:
     """Parakeet-EOU-120M INT8 ONNX Model."""
 
@@ -187,6 +203,7 @@ class ParakeetEOU:
         if audio_samples.dtype == np.int16:
             audio_samples = audio_samples.astype(np.float32) / 32768.0
 
+        audio_samples = trim_trailing_silence(audio_samples)
         self.reset()
         full_mel = compute_mel_spectrogram(audio_samples)
         total_frames = full_mel.shape[1]

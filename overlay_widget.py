@@ -77,24 +77,24 @@ class FloatingVoicePill:
             self.thread = threading.Thread(target=self._run_tk, daemon=True)
             self.thread.start()
 
-    def play_sfx(self, cue_type: str = "start"):
-        """Play OpenWhispr harmonic chime."""
+        self.sfx_enabled = True
+
+    def play_sfx(self, cue_type: str = "wake"):
+        """Play OpenWhispr harmonic chime (wake: C5->E5, sleep: D5->A4)."""
+        if not self.sfx_enabled:
+            return
         try:
-            if cue_type == "start" and self.start_cue:
+            if cue_type in ("wake", "start") and self.start_cue:
                 self.start_cue.play()
-            elif cue_type in ("stop", "end") and self.stop_cue:
+            elif cue_type in ("sleep", "stop", "end") and self.stop_cue:
                 self.stop_cue.play()
         except Exception:
             pass
 
     def set_state(self, state: str):
-        """Set widget state: 'idle', 'recording', 'processing', 'speaking'."""
+        """Set widget state: 'idle', 'recording', 'listening', 'processing', 'speaking'."""
         self.state = state
         self.queue.put(("state", state))
-        if state == "recording":
-            self.play_sfx("start")
-        elif state in ("processing", "idle"):
-            self.play_sfx("stop")
 
     def update_volume(self, vol: float):
         """Update live audio level (0.0 to 1.0)."""
@@ -200,7 +200,7 @@ class FloatingVoicePill:
                 return
 
         # Manage auto-show and auto-hide
-        if self.state in ("recording", "processing", "speaking"):
+        if self.state in ("recording", "processing", "speaking", "listening"):
             if not self._is_visible:
                 self.root.deiconify()
                 self._is_visible = True
@@ -239,6 +239,28 @@ class FloatingVoicePill:
                     bx, mid_y + bar_h / 2,
                     fill="#f4f4f5",
                     width=2.5,
+                    capstyle="round"
+                )
+
+        elif self.state == "listening":
+            # 110px pill showing gentle breathing wave bars (attentive follow-up mode)
+            w = self.w_rec
+            self._draw_pill_bg(w, self.h, fill="#16161a", outline="#0284c7")
+            self._draw_mic_icon(20, self.h / 2)
+
+            num_bars = 6
+            start_x = 44
+            bar_gap = 9
+            mid_y = self.h / 2
+            t_ms = time.time() * 4
+            for i in range(num_bars):
+                bx = start_x + i * bar_gap
+                pulse = 3 + 5 * (0.5 + 0.5 * math.sin(t_ms - i * 0.6))
+                self.canvas.create_line(
+                    bx, mid_y - pulse,
+                    bx, mid_y + pulse,
+                    fill="#38bdf8",
+                    width=2,
                     capstyle="round"
                 )
 
