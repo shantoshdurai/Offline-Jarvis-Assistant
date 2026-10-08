@@ -80,7 +80,7 @@ Runs completely offline on your hardware with zero internet required:
 2. Place your preferred GGUF model in the `models/` directory (e.g. `qwen2.5-coder-3b-instruct-q4_k_m.gguf`).
 3. Double-click `jarvis.bat` or run:
    ```powershell
-   python gui.py
+   python fast_agent.py
    ```
 
 ---
