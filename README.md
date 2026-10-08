@@ -8,15 +8,20 @@ A high-performance AI assistant and developer copilot for Windows, supporting bo
 
 The Fast Agent is engineered for instant responsiveness with minimal latency and smart fallbacks:
 
+- **OpenWhispr-Style Silent Background Operation**:
+  - **1st Launch**: Starts silently into the Windows system tray with a custom blue pill icon (zero intrusive terminal windows).
+  - **Floating Voice Pill**: Pressing `Ctrl+Shift+Space` (or saying `"Hey Jarvis"`) pops up the transparent floating pill overlay with dancing waveform equalizer bars and exact OpenWhispr harmonic chimes (C5 $\rightarrow$ E5 start, D5 $\rightarrow$ A4 stop). Tucks away automatically when done.
+  - **2nd Launch / Windows Search**: Searching "Jarvis" in Windows Search or clicking the tray icon instantly brings up the sleek dark modern dashboard GUI (activity feed, chat, quick actions, settings).
+  - **Single-Instance IPC (Port 49155)**: Automatically prevents multiple running instances and routes launch events to the active assistant.
+  - **Clean 1-Click Shutdown**: Click "Stop Jarvis" in the dashboard or tray to terminate completely and release all mic/hardware resources.
 - **Sub-50ms Speech Recognition**: Powered by NVIDIA's `Parakeet-EOU-120M` INT8 ONNX streaming model with instant End-of-Utterance (`<EOU>`) boundary detection. Falls back automatically to `faster-whisper`.
 - **DeepSeek 4.1 Flash**: Ultra-fast, low-cost intelligence via OpenRouter with automatic zero-cost fallback to `openrouter/free` if limits or network issues occur.
 - **Direct YouTube Video Player**: Queries YouTube and directly launches and plays the top matching video (instead of just opening search result pages).
-- **Modality-Aware Pipeline**: Distinguishes `[Voice Input]` from `[Typed Input]` so Jarvis always knows whether you spoke into your mic or typed into the console.
+- **Modality-Aware Pipeline**: Distinguishes `[Voice Input]` from `[Typed Input]` so Jarvis always knows whether you spoke into your mic or typed into the dashboard.
 - **Push-to-Talk & Wake Word**:
-  - Global Hotkeys: `Ctrl+Shift+Space` or `Ctrl+Alt+J` (preserves your `Ctrl+Win` for OpenWhisper and `Alt+Space` for PowerToys).
+  - Global Hotkeys: `Ctrl+Shift+Space`, `Ctrl+Alt+J`, and `Ctrl+Win`.
   - Background Wake Word: Always-listening `"Hey Jarvis"` via OpenWakeWord.
 - **Dynamic Mic Calibration**: Automatically measures your microphone's ambient noise floor on startup to prevent stuck voice detection on laptop mic arrays.
-- **Real-time Title Bar Telemetry**: Live mic volume level, wake word confidence score, and state indicator directly in the Windows console title bar.
 - **Dual Voice Engine**: High-fidelity Edge-TTS neural speech (`en-GB-RyanNeural`) with instant offline Windows SAPI (`pyttsx3`) fallback if Microsoft servers or DNS are unavailable.
 
 ### Quick Start (Fast Agent)
@@ -40,19 +45,18 @@ The Fast Agent is engineered for instant responsiveness with minimal latency and
    ```
 
 4. **Launch**:
-   Double-click `fast_jarvis.bat` or run:
-   ```bash
-   python fast_agent.py
-   ```
+   - Double-click `fast_jarvis.bat` or press the Windows Start key, type **Jarvis**, and hit Enter.
+   - It will run quietly in the system tray.
+   - Searching **Jarvis** a second time brings up the modern dashboard.
+   - To launch with an interactive console for debugging, run: `fast_jarvis.bat --console`.
 
 5. **Auto-Start on Boot & Shortcut Keys**:
    - Double-click `enable_startup.bat` to have Jarvis launch silently into the system tray on every Windows boot.
    - **Global Shortcuts (Active 24/7 anywhere in Windows)**:
-     - `Ctrl + Shift + Space` : Push-to-talk voice command (beeps, records, transcribes in <50ms, and responds).
-     - `Ctrl + Alt + J` : Secondary voice trigger / launcher shortcut.
-     - `Ctrl + Alt + H` : Show or hide the console window.
+     - `Ctrl + Shift + Space` / `Ctrl + Alt + J` / `Ctrl + Win` : Push-to-talk voice command.
+     - `Ctrl + Alt + H` : Show or hide debug console window.
      - `"Hey Jarvis"` : Hands-free wake word.
-     - System Tray Icon : Right-click by the clock to toggle console, trigger voice, or quit.
+     - System Tray Icon : Double-click to open Dashboard, right-click to trigger voice or stop Jarvis.
    - To disable auto-start, double-click `disable_startup.bat`.
 
 ---

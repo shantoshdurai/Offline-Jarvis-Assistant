@@ -1,21 +1,33 @@
 """Fast Agent Engine for Jarvis AI.
 
 Features:
+- Single-instance IPC architecture on port 49155:
+    * 1st launch: Starts silently in Windows notification tray with OpenWhispr-style blue icon
+    * 2nd launch (or tray click): Brings up the sleek OpenWhispr modern dark dashboard GUI
 - Sub-50ms streaming STT with NVIDIA Parakeet-EOU-120M INT8 ONNX
 - Automatic Whisper base.en fallback
 - Direct YouTube Video Player (resolves top video ID and plays directly)
 - DeepSeek 4.1 Flash via OpenRouter with automatic zero-cost fallback to openrouter/free
+- Minimal lightweight system prompt for near-instant cold start
 - Modality awareness: [Voice Input] vs [Typed Input]
-- Push-to-talk hotkeys: Ctrl+Shift+Space or Ctrl+Alt+J (avoids Ctrl+Win / Alt+Space conflicts)
+- Push-to-talk hotkeys: Ctrl+Shift+Space, Ctrl+Alt+J, and Ctrl+Win
 - Continuous wake-word engine: 'Hey Jarvis'
-- Real-time Title Bar visual telemetry (mic volume, wake score, ready state)
-- Dynamic ambient noise calibration for laptop microphone arrays
-- Edge-TTS neural speech with offline Windows SAPI fallback
-- Full local PC control tools (apps, files, folders, commands, screen OCR, volume, LeetCode)
+- OpenWhispr floating voice pill overlay with live animated waveform equalizer & C5->E5 sound cues
+- Minimize-to-tray on 'X' button, clean 1-click 'Stop Jarvis' shutdown
 """
 
 import os
 import sys
+
+# Hide console window immediately if not launched with --console
+import ctypes
+if "--console" not in sys.argv:
+    try:
+        hwnd = ctypes.windll.kernel32.GetConsoleWindow()
+        if hwnd:
+            ctypes.windll.user32.ShowWindow(hwnd, 0)
+    except Exception:
+        pass
 
 try:
     if hasattr(sys.stdout, "reconfigure"):
@@ -28,6 +40,7 @@ except Exception:
 import time
 import json
 import queue
+import socket
 import asyncio
 import threading
 import subprocess
@@ -40,7 +53,7 @@ import numpy as np
 import pyaudio
 import pygame
 import winsound
-import ctypes
+
 try:
     from dotenv import load_dotenv
 except ImportError:
@@ -64,8 +77,9 @@ except ImportError:
 import tools
 from parakeet_stt import ParakeetEOU
 from overlay_widget import FloatingVoicePill
+from dashboard_gui import JarvisDashboard
 
-# Load environment configuration
+# Base directories & environment
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 env_path = os.path.join(BASE_DIR, ".env")
 if os.path.exists(env_path):
@@ -73,6 +87,7 @@ if os.path.exists(env_path):
 else:
     load_dotenv()
 
+IPC_PORT = 49155
 OPENROUTER_API_KEY = os.getenv("OPENROUTER_API_KEY", "")
 OPENROUTER_MODEL = os.getenv("OPENROUTER_MODEL", "deepseek/deepseek-v4.1-flash")
 FALLBACK_MODEL = os.getenv("FALLBACK_MODEL", "openrouter/free")
@@ -86,24 +101,17 @@ CHUNK = 1280
 
 # Pygame mixer for audio playback
 try:
-    pygame.mixer.init()
+    if not pygame.mixer.get_init():
+        pygame.mixer.init()
 except Exception:
     pass
 
-SYSTEM_PROMPT = """You are Jarvis, Shantosh's lightning-fast personal AI assistant and pair programmer running on his Windows PC.
-Always identify as Jarvis. You are powered by DeepSeek via OpenRouter.
-If Shantosh asks who you are, what model you are, or what version you are running, state clearly: "I am Jarvis, powered by DeepSeek via OpenRouter." Never claim to be Claude, Anthropic, ChatGPT, or OpenAI.
-
-MODALITY AWARENESS:
-Shantosh communicates with you via two tagged input types:
-1. [Voice Input]: Shantosh spoke to you aloud via microphone, transcribed in real time by your NVIDIA Parakeet-EOU speech engine. You CAN hear him! When he asks if you hear him via voice, confirm you hear him loud and clear through the mic.
-2. [Typed Input]: Shantosh typed directly into your terminal on his keyboard. You know with 100% certainty that he typed it, not spoke it.
-
-VOICE & RESPONSE RULES:
-- Speak directly, concisely, and naturally. Usually 1-2 spoken sentences.
-- When the user asks to play a video, song, or music on YouTube, invoke the play_video tool.
-- When asked to open an application, folder, change volume, or run a command, ALWAYS invoke the corresponding tool.
-- Never read raw programming syntax or markdown formatting out loud.
+# Minimal lightweight system prompt for fastest response and low cold-start latency
+SYSTEM_PROMPT = """You are Jarvis, a fast personal voice AI assistant and pair programmer running on Windows.
+- Speak directly, concisely, and naturally (1-2 sentences for spoken replies).
+- When asked to play music or videos on YouTube, use play_video.
+- When asked to open apps, websites, folders, or adjust volume, use the appropriate tool.
+- Do not read out code blocks, markdown syntax, or long lists.
 """
 
 TOOL_DEFINITIONS = [
@@ -320,42 +328,69 @@ def dispatch_tool_call(name: str, args: Dict[str, Any]) -> str:
         return f"Error executing {name}: {e}"
 
 
+def check_single_instance(port: int = IPC_PORT) -> bool:
+    """Returns True if Jarvis is already running and signaled, False if this is primary."""
+    s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    try:
+        s.connect(("127.0.0.1", port))
+        s.sendall(b"SHOW_DASHBOARD\n")
+        try:
+            s.settimeout(0.6)
+            s.recv(1024)
+        except Exception:
+            pass
+        s.close()
+        return True
+    except (ConnectionRefusedError, OSError):
+        return False
+
+
 class FastAgent:
     def __init__(self):
         print("============================================================")
         print("  Jarvis Fast Agent (DeepSeek 4.1 Flash + Parakeet-EOU INT8)")
         print("============================================================\n")
 
-        # 1. Check API Key
-        if not OPENROUTER_API_KEY:
-            print("[Warning] OPENROUTER_API_KEY is not set in .env! LLM queries may fail.")
-            print("Please create a .env file with OPENROUTER_API_KEY=your_key_here\n")
+        self.is_running = True
+        self.wake_word_enabled = True
 
-        # 2. Load Parakeet EOU
-        print("Loading NVIDIA Parakeet-EOU-120M INT8 speech recognizer...")
+        # 1. Initialize Dashboard GUI
+        self.dashboard = JarvisDashboard(
+            on_trigger_voice=self.trigger_voice,
+            on_send_chat=lambda text: self.execute_command_pipeline(text, source="typed"),
+            on_stop_jarvis=self.shutdown,
+            on_save_api_key=self.save_api_key,
+            on_toggle_wake_word=self.set_wake_word_enabled,
+        )
+
+        # 2. OpenWhispr Floating Voice Pill Overlay (attached to CTk root)
+        try:
+            self.pill = FloatingVoicePill(parent=self.dashboard.root)
+            print("[OK] OpenWhispr Floating Voice Pill overlay active")
+        except Exception as e:
+            print(f"[Notice] Floating overlay error: {e}")
+            self.pill = None
+
+        # 3. Speech Recognizer (NVIDIA Parakeet-EOU INT8)
         self.stt = None
         try:
             self.stt = ParakeetEOU()
-            print("[OK] Parakeet-EOU ready (<EOU> end-of-turn detection active)")
+            print("[OK] Parakeet-EOU INT8 speech engine active")
         except Exception as e:
-            print(f"[Notice] Parakeet-EOU model not found or error ({e}).")
-            print("Falling back to Whisper. (To use Parakeet, run: python download_parakeet.py)")
+            print(f"[Notice] Parakeet-EOU error ({e}). Whisper fallback active.")
 
-        # 3. Whisper fallback
         self.whisper_model = None
 
-        # 4. Load OpenWakeWord
-        print("Loading wake word engine ('Hey Jarvis')...")
+        # 4. OpenWakeWord Model ('Hey Jarvis')
+        self.oww = None
         try:
             from openwakeword.model import Model
             self.oww = Model(wakeword_models=["hey_jarvis"], inference_framework="onnx")
-            print("[OK] Wake word engine active")
+            print("[OK] Continuous Wake Word active ('Hey Jarvis')")
         except Exception as e:
-            print(f"[Warning] OpenWakeWord error ({e}). Hotkey push-to-talk will be used.")
-            self.oww = None
+            print(f"[Warning] OpenWakeWord error ({e}).")
 
-        # 5. Initialize PyAudio stream
-        print("Initializing microphone stream...")
+        # 5. Microphone Stream
         self.audio = pyaudio.PyAudio()
         self.mic_stream = self.audio.open(
             format=FORMAT,
@@ -365,10 +400,9 @@ class FastAgent:
             frames_per_buffer=CHUNK
         )
 
-        # 6. Calibrate noise floor for laptop microphones
-        print("Calibrating microphone ambient noise floor (0.5s)...")
+        # 6. Ambient Noise Calibration
         calib_frames = []
-        for _ in range(int(RATE / CHUNK * 0.5)):
+        for _ in range(int(RATE / CHUNK * 0.4)):
             data = self.mic_stream.read(CHUNK, exception_on_overflow=False)
             calib_frames.append(np.frombuffer(data, dtype=np.int16))
         all_calib = np.concatenate(calib_frames)
@@ -376,7 +410,7 @@ class FastAgent:
         self.speech_threshold = max(800, int(self.noise_floor * 1.35))
         print(f"[OK] Calibrated noise floor: {self.noise_floor} | Speech threshold: {self.speech_threshold}")
 
-        # 7. State & Synchronization
+        # 7. State & Queues
         self.is_listening = threading.Event()
         self.is_speaking = threading.Event()
         self.command_queue = queue.Queue()
@@ -384,7 +418,7 @@ class FastAgent:
             {"role": "system", "content": SYSTEM_PROMPT}
         ]
 
-        # 8. SAPI offline voice fallback
+        # 8. SAPI Voice Fallback
         try:
             import pyttsx3
             self.sapi_engine = pyttsx3.init()
@@ -392,84 +426,123 @@ class FastAgent:
         except Exception:
             self.sapi_engine = None
 
-        # 9. Global Hotkey Listener (Ctrl+Shift+Space and Ctrl+Alt+J)
-        self.setup_hotkey()
+        # 9. Register Global Hotkeys
+        self.setup_hotkeys()
 
-        # 10. OpenWhispr Floating Voice Pill Overlay
-        print("Launching OpenWhispr Floating Voice Pill Overlay...")
+        # 10. Start IPC Server thread
+        self.ipc_thread = threading.Thread(target=self._run_ipc_server, daemon=True)
+        self.ipc_thread.start()
+
+        # 11. Start System Tray Icon
+        self.tray_thread = threading.Thread(target=self._setup_tray, daemon=True)
+        self.tray_thread.start()
+
+        # 12. Start Background Worker Threads
+        self.listener_thread = threading.Thread(target=self._wake_word_listener, daemon=True)
+        self.listener_thread.start()
+
+        self.worker_thread = threading.Thread(target=self._worker_loop, daemon=True)
+        self.worker_thread.start()
+
+        # 13. Terminal input thread if console is open
+        if "--console" in sys.argv:
+            self.t_input = threading.Thread(target=self._terminal_input_loop, daemon=True)
+            self.t_input.start()
+
+    def set_wake_word_enabled(self, enabled: bool):
+        self.wake_word_enabled = enabled
+
+    def save_api_key(self, key: str):
+        global OPENROUTER_API_KEY
+        OPENROUTER_API_KEY = key
+        os.environ["OPENROUTER_API_KEY"] = key
         try:
-            self.pill = FloatingVoicePill()
-            print("[OK] Floating Voice Pill active (animated waveform overlay)")
+            with open(env_path, "w", encoding="utf-8") as f:
+                f.write(f"OPENROUTER_API_KEY={key}\n")
+                f.write(f"OPENROUTER_MODEL={OPENROUTER_MODEL}\n")
+                f.write(f"FALLBACK_MODEL={FALLBACK_MODEL}\n")
+                f.write(f"WAKE_THRESHOLD={WAKE_THRESHOLD}\n")
+        except Exception:
+            pass
+
+    def _run_ipc_server(self):
+        """Single-instance IPC server to handle 2nd launch signals."""
+        srv = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        srv.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        try:
+            srv.bind(("127.0.0.1", IPC_PORT))
+            srv.listen(5)
+            while self.is_running:
+                try:
+                    conn, _ = srv.accept()
+                    data = conn.recv(1024).decode("utf-8").strip()
+                    if data == "SHOW_DASHBOARD":
+                        conn.sendall(b"OK\n")
+                        self.dashboard.show()
+                    elif data == "TRIGGER_VOICE":
+                        conn.sendall(b"OK\n")
+                        self.trigger_voice()
+                    elif data == "STOP":
+                        conn.sendall(b"OK\n")
+                        self.shutdown()
+                    else:
+                        conn.sendall(b"OK\n")
+                    conn.close()
+                except Exception:
+                    pass
         except Exception as e:
-            print(f"[Notice] Floating overlay disabled: {e}")
-            self.pill = None
-
-    def get_whisper(self):
-        """Lazy loader for faster-whisper fallback."""
-        if self.whisper_model is None:
-            from faster_whisper import WhisperModel
-            self.whisper_model = WhisperModel("base.en", device="cpu", compute_type="int8")
-        return self.whisper_model
-
-    def play_chime(self, sound_type: str = "start"):
-        """Play OpenWhispr synthesized harmonic chime."""
-        if hasattr(self, "pill") and self.pill:
-            self.pill.play_sfx(sound_type)
-        else:
+            print(f"[Warning] IPC Server bind error: {e}")
+        finally:
             try:
-                if sound_type == "start":
-                    winsound.MessageBeep(winsound.MB_ICONASTERISK)
-                elif sound_type in ("end", "stop"):
-                    winsound.MessageBeep(winsound.MB_OK)
+                srv.close()
             except Exception:
                 pass
 
-    def setup_tray(self):
-        """Setup Windows notification tray icon with controls."""
+    def _setup_tray(self):
+        """Windows system tray icon with OpenWhispr blue circular badge."""
         try:
             import pystray
             from PIL import Image, ImageDraw
 
             def create_tray_image():
-                width, height = 64, 64
-                img = Image.new('RGBA', (width, height), (0, 0, 0, 0))
+                size = 64
+                img = Image.new('RGBA', (size, size), (0, 0, 0, 0))
                 d = ImageDraw.Draw(img)
-                d.ellipse((6, 6, 58, 58), fill=(0, 200, 255, 255), outline=(255, 255, 255, 255), width=3)
-                d.ellipse((20, 20, 44, 44), fill=(255, 255, 255, 255))
+                d.rounded_rectangle((4, 10, size - 4, size - 10), radius=16, fill=(14, 116, 224, 255))
+                d.ellipse((14, 22, 30, 42), outline=(255, 255, 255, 255), width=3)
+                d.ellipse((size - 30, 22, size - 14, 42), outline=(255, 255, 255, 255), width=3)
+                d.line((26, 24, size - 26, 40), fill=(255, 255, 255, 255), width=3)
+                d.line((26, 40, size - 26, 24), fill=(255, 255, 255, 255), width=3)
                 return img
 
-            def on_trigger_voice(icon, item):
-                if not self.is_listening.is_set() and not self.is_speaking.is_set():
-                    self.is_listening.set()
-                    self.command_queue.put("HOTKEY")
+            def on_open_dashboard(icon=None, item=None):
+                self.dashboard.show()
 
-            def toggle_console(icon=None, item=None):
-                hwnd = ctypes.windll.kernel32.GetConsoleWindow()
-                if hwnd:
-                    is_visible = ctypes.windll.user32.IsWindowVisible(hwnd)
-                    ctypes.windll.user32.ShowWindow(hwnd, 0 if is_visible else 5)
+            def on_trigger_voice(icon=None, item=None):
+                self.trigger_voice()
 
-            def on_quit(icon, item):
-                icon.stop()
-                os._exit(0)
+            def on_quit(icon=None, item=None):
+                self.shutdown()
 
             menu = pystray.Menu(
-                pystray.MenuItem('🎙️ Trigger Voice (Ctrl+Shift+Space)', on_trigger_voice),
-                pystray.MenuItem('Show / Hide Console (Ctrl+Alt+H)', toggle_console, default=True),
-                pystray.MenuItem('Quit Jarvis', on_quit)
+                pystray.MenuItem('🖥️  Open Dashboard', on_open_dashboard, default=True),
+                pystray.MenuItem('🎙️  Push to Talk (Ctrl+Shift+Space)', on_trigger_voice),
+                pystray.MenuItem('🛑  Stop Jarvis', on_quit)
             )
-            self.tray_icon = pystray.Icon("JarvisFastAgent", create_tray_image(), "Jarvis AI (Ctrl+Shift+Space)", menu)
-            self.tray_icon.run()
-        except Exception:
-            pass
 
-    def setup_hotkey(self):
-        """Set up push-to-talk hotkeys (Ctrl+Shift+Space, Ctrl+Alt+J) and console toggle (Ctrl+Alt+H)."""
-        def on_hotkey():
-            if not self.is_listening.is_set() and not self.is_speaking.is_set():
-                print("\n[Push-to-Talk Hotkey Triggered]")
-                self.is_listening.set()
-                self.command_queue.put("HOTKEY")
+            icon_img = create_tray_image()
+            self.tray_icon = pystray.Icon("JarvisAgent", icon_img, "Jarvis AI — Voice Copilot", menu)
+            self.tray_icon.run()
+        except Exception as e:
+            print(f"[Notice] System tray icon: {e}")
+
+    def setup_hotkeys(self):
+        """Global Hotkeys: Ctrl+Shift+Space, Ctrl+Alt+J, and Ctrl+Win."""
+        if keyboard is None:
+            return
+
+        def on_ptt():
+            self.trigger_voice()
 
         def toggle_console():
             hwnd = ctypes.windll.kernel32.GetConsoleWindow()
@@ -477,89 +550,148 @@ class FastAgent:
                 is_visible = ctypes.windll.user32.IsWindowVisible(hwnd)
                 ctypes.windll.user32.ShowWindow(hwnd, 0 if is_visible else 5)
 
-        if keyboard is not None:
-            try:
-                self.hotkey_listener = keyboard.GlobalHotKeys({
-                    '<ctrl>+<shift>+<space>': on_hotkey,
-                    '<ctrl>+<alt>+j': on_hotkey,
-                    '<ctrl>+<alt>+h': toggle_console,
-                })
-                self.hotkey_listener.daemon = True
-                self.hotkey_listener.start()
-                print("[OK] Push-to-talk active: Ctrl+Shift+Space or Ctrl+Alt+J (Console toggle: Ctrl+Alt+H)")
-            except Exception as e:
-                print(f"[Warning] Hotkey setup: {e}")
+        hotkey_bindings = {
+            '<ctrl>+<shift>+<space>': on_ptt,
+            '<ctrl>+<alt>+j': on_ptt,
+            '<ctrl>+<alt>+h': toggle_console,
+        }
 
-    def tts_speak(self, text: str):
-        """Neural speech output using Edge-TTS with instant Windows SAPI fallback."""
-        if not text.strip():
-            return
-
-        clean_text = text.replace("```", "").replace("**", "").replace("*", "").strip()
-        print(f"\n🤖 Jarvis: {clean_text}\n")
-
-        self.is_speaking.set()
-        temp_audio = os.path.join(
-            os.path.expanduser("~"),
-            "AppData", "Local", "Temp",
-            f"jarvis_voice_{uuid.uuid4().hex[:8]}.mp3"
-        )
-
-        async def generate_speech():
-            import edge_tts
-            comm = edge_tts.Communicate(clean_text, voice="en-GB-RyanNeural", rate="+10%")
-            await comm.save(temp_audio)
+        # Try registering Ctrl+Cmd (Ctrl+Win) safely
+        try:
+            hotkey_bindings['<ctrl>+<cmd>'] = on_ptt
+        except Exception:
+            pass
 
         try:
-            asyncio.run(generate_speech())
-            if os.path.exists(temp_audio):
-                pygame.mixer.music.load(temp_audio)
-                pygame.mixer.music.play()
-                while pygame.mixer.music.get_busy():
-                    time.sleep(0.04)
-                pygame.mixer.music.unload()
-                try:
-                    os.remove(temp_audio)
-                except Exception:
-                    pass
+            self.hotkey_listener = keyboard.GlobalHotKeys(hotkey_bindings)
+            self.hotkey_listener.daemon = True
+            self.hotkey_listener.start()
+            print("[OK] Hotkeys: Ctrl+Shift+Space | Ctrl+Alt+J | Ctrl+Win (Console: Ctrl+Alt+H)")
         except Exception as e:
-            # Instant SAPI offline fallback
+            print(f"[Warning] Hotkey setup issue: {e}")
+
+    def trigger_voice(self):
+        """Triggers push-to-talk voice recording."""
+        if not self.is_listening.is_set() and not self.is_speaking.is_set():
+            self.is_listening.set()
+            self.command_queue.put("TRIGGER")
+
+    def play_chime(self, cue_type: str = "start"):
+        """Plays OpenWhispr harmonic chime."""
+        if self.pill:
+            self.pill.play_sfx(cue_type)
+        else:
             try:
-                if self.sapi_engine:
-                    self.sapi_engine.say(clean_text)
-                    self.sapi_engine.runAndWait()
+                if cue_type == "start":
+                    winsound.MessageBeep(winsound.MB_ICONASTERISK)
                 else:
-                    import pyttsx3
-                    engine = pyttsx3.init()
-                    engine.setProperty("rate", 185)
-                    engine.say(clean_text)
-                    engine.runAndWait()
-            except Exception as e2:
-                print(f"(Speech playback error: {e2})")
-        finally:
-            # 1. Allow speaker reverberation in room to dissipate
-            time.sleep(0.35)
-            # 2. Flush microphone stream buffer so speaker audio is never re-processed
-            try:
-                while self.mic_stream.get_read_available() > 0:
-                    self.mic_stream.read(self.mic_stream.get_read_available(), exception_on_overflow=False)
+                    winsound.MessageBeep(winsound.MB_OK)
             except Exception:
                 pass
-            # 3. Reset wake word detector state
-            if self.oww is not None:
-                self.oww.reset()
-            # 4. Drain any pending false triggers from command queue
-            while not self.command_queue.empty():
-                try:
-                    self.command_queue.get_nowait()
-                except queue.Empty:
-                    break
-            self.is_speaking.clear()
-            if hasattr(self, "pill") and self.pill:
+
+    def get_whisper(self):
+        if self.whisper_model is None:
+            from faster_whisper import WhisperModel
+            self.whisper_model = WhisperModel("base.en", device="cpu", compute_type="int8")
+        return self.whisper_model
+
+    def record_audio(self, max_duration: float = 12.0, silence_limit: float = 1.3, start_timeout: float = 4.0) -> np.ndarray:
+        """Records voice with live waveform equalizer on floating pill."""
+        if self.pill:
+            self.pill.set_state("recording")
+        else:
+            self.play_chime("start")
+
+        frames = []
+        silent_chunks = 0
+        chunks_per_sec = RATE / CHUNK
+        max_silent_chunks = int(silence_limit * chunks_per_sec)
+        max_total_chunks = int(max_duration * chunks_per_sec)
+        timeout_chunks = int(start_timeout * chunks_per_sec)
+        talking_started = False
+
+        # Flush stale mic buffer
+        while self.mic_stream.get_read_available() > 0:
+            self.mic_stream.read(self.mic_stream.get_read_available(), exception_on_overflow=False)
+
+        for i in range(max_total_chunks):
+            data = self.mic_stream.read(CHUNK, exception_on_overflow=False)
+            frames.append(data)
+
+            audio_data = np.frombuffer(data, dtype=np.int16)
+            volume = np.abs(audio_data).mean()
+
+            # Stream live volume level to floating pill waveform
+            if self.pill:
+                norm = min(1.0, max(0.0, (volume - self.noise_floor) / max(600, self.speech_threshold - self.noise_floor + 200)))
+                self.pill.update_volume(norm)
+
+            if volume > self.speech_threshold:
+                talking_started = True
+                silent_chunks = 0
+            elif talking_started:
+                silent_chunks += 1
+
+            if talking_started and silent_chunks > max_silent_chunks:
+                break
+            if not talking_started and i > timeout_chunks:
+                break
+
+        if self.pill:
+            self.pill.set_state("processing")
+        else:
+            self.play_chime("stop")
+
+        if not talking_started or not frames:
+            if self.pill:
                 self.pill.set_state("idle")
+            return np.zeros(0, dtype=np.int16)
+
+        return np.concatenate([np.frombuffer(f, dtype=np.int16) for f in frames])
+
+    def transcribe(self, audio_data: np.ndarray) -> str:
+        """Transcribe speech using Parakeet-EOU INT8, with Whisper fallback."""
+        if len(audio_data) < RATE * 0.4:
+            return ""
+
+        # Parakeet-EOU INT8
+        if self.stt is not None:
+            try:
+                t0 = time.time()
+                text = self.stt.transcribe(audio_data)
+                if text.strip():
+                    print(f"⚡ STT (Parakeet-EOU): \"{text.strip()}\" ({time.time()-t0:.2f}s)")
+                    return text.strip()
+            except Exception:
+                pass
+
+        # Whisper fallback
+        try:
+            whisper = self.get_whisper()
+            import tempfile, wave
+            with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as tf:
+                wav_path = tf.name
+            with wave.open(wav_path, "wb") as wf:
+                wf.setnchannels(CHANNELS)
+                wf.setsampwidth(self.audio.get_sample_size(FORMAT))
+                wf.setframerate(RATE)
+                wf.writeframes(audio_data.tobytes())
+
+            segments, _ = whisper.transcribe(wav_path, beam_size=1)
+            whisper_text = "".join([s.text for s in segments]).strip()
+            try:
+                os.remove(wav_path)
+            except Exception:
+                pass
+            if whisper_text:
+                return whisper_text
+        except Exception:
+            pass
+
+        return ""
 
     def query_llm(self, user_text: str) -> Tuple[str, List[Dict[str, Any]]]:
-        """Query DeepSeek 4.1 Flash via OpenRouter with automatic fallback to free models."""
+        """Query DeepSeek 4.1 Flash via OpenRouter with automatic zero-cost fallback."""
         self.history.append({"role": "user", "content": user_text})
 
         req_body = {
@@ -589,7 +721,7 @@ class FastAgent:
             tool_calls = choice.get("tool_calls") or []
             return content, tool_calls
         except Exception as e:
-            print(f"⚠️ Primary model error ({e}), switching to free fallback model ({FALLBACK_MODEL})...")
+            print(f"⚠️ Primary model error ({e}), switching to fallback ({FALLBACK_MODEL})...")
             req_body["model"] = FALLBACK_MODEL
             req_fallback = urllib.request.Request(
                 "https://openrouter.ai/api/v1/chat/completions",
@@ -608,30 +740,21 @@ class FastAgent:
                 return f"Sorry, network error: {e2}", []
 
     def execute_command_pipeline(self, user_text: str, source: str = "voice"):
-        """Process user command, call LLM & tools, and speak reply."""
-        # Filter out brief acoustic noise, coughs, or empty filler murmurs
+        """Processes user command, calls LLM & tools, speaks reply, and updates dashboard."""
         clean_text = user_text.lower().strip(" .,?!\"'")
         if clean_text in ("", "mmhm", "mhm", "uh", "um", "ah", "hm", "huh", "yeah", "ok", "okay"):
-            print(f"(Ignored brief acoustic noise/filler: '{user_text}')")
-            if hasattr(self, "pill") and self.pill:
+            if self.pill:
                 self.pill.set_state("idle")
             return
 
-        if hasattr(self, "pill") and self.pill:
+        if self.pill:
             self.pill.set_state("processing")
 
-        if source == "voice":
-            print(f"\n📝 Heard (Voice): \"{user_text}\"")
-            prompt = f"[Voice Input]: {user_text}"
-        else:
-            print(f"\n⌨️ Typed (Console): \"{user_text}\"")
-            prompt = f"[Typed Input]: {user_text}"
-
-        t_start = time.time()
+        prompt = f"[Voice Input]: {user_text}" if source == "voice" else f"[Typed Input]: {user_text}"
         content, tool_calls = self.query_llm(prompt)
-        t_llm = time.time() - t_start
 
         tool_results = []
+        executed_tool_name = ""
         if tool_calls:
             for tc in tool_calls:
                 fn = tc.get("function", {})
@@ -641,10 +764,10 @@ class FastAgent:
                     args = json.loads(args_str)
                 except Exception:
                     args = {}
-                print(f"⚡ [Tool Call]: {name}({args})")
+                print(f"⚡ [Tool]: {name}({args})")
                 res = dispatch_tool_call(name, args)
-                print(f"   ↳ {res}")
                 tool_results.append(res)
+                executed_tool_name = name
 
         spoken_response = content.strip()
         if not spoken_response and tool_results:
@@ -653,134 +776,96 @@ class FastAgent:
             spoken_response = "Done."
 
         self.history.append({"role": "assistant", "content": spoken_response})
-        print(f"⚡ Latency: LLM {t_llm:.2f}s")
-        if hasattr(self, "pill") and self.pill:
+
+        # Add interaction to Dashboard GUI feed
+        self.dashboard.add_interaction(
+            user_text=user_text,
+            response=spoken_response,
+            source=source,
+            tool=executed_tool_name
+        )
+
+        if self.pill:
             self.pill.set_state("speaking")
+
         self.tts_speak(spoken_response)
 
-    def record_audio(self, max_duration: float = 12.0, silence_limit: float = 1.3, start_timeout: float = 4.0) -> np.ndarray:
-        """Record audio with OpenWhispr floating pill and animated waveform."""
-        print("\n🎙️  Listening! Speak your command...")
-        if hasattr(self, "pill") and self.pill:
-            self.pill.set_state("recording")
-        else:
-            self.play_chime("start")
+    def tts_speak(self, text: str):
+        """Neural Edge-TTS speech with instant offline SAPI fallback."""
+        if not text.strip():
+            return
 
-        frames = []
-        silent_chunks = 0
-        chunks_per_sec = RATE / CHUNK
-        max_silent_chunks = int(silence_limit * chunks_per_sec)
-        max_total_chunks = int(max_duration * chunks_per_sec)
-        timeout_chunks = int(start_timeout * chunks_per_sec)
+        clean_text = text.replace("```", "").replace("**", "").replace("*", "").strip()
+        self.is_speaking.set()
 
-        talking_started = False
+        temp_audio = os.path.join(
+            os.path.expanduser("~"),
+            "AppData", "Local", "Temp",
+            f"jarvis_voice_{uuid.uuid4().hex[:8]}.mp3"
+        )
 
-        # Flush stale mic buffer
-        while self.mic_stream.get_read_available() > 0:
-            self.mic_stream.read(self.mic_stream.get_read_available(), exception_on_overflow=False)
+        async def generate_speech():
+            import edge_tts
+            comm = edge_tts.Communicate(clean_text, voice="en-GB-RyanNeural", rate="+10%")
+            await comm.save(temp_audio)
 
-        for i in range(max_total_chunks):
-            data = self.mic_stream.read(CHUNK, exception_on_overflow=False)
-            frames.append(data)
-
-            audio_data = np.frombuffer(data, dtype=np.int16)
-            volume = np.abs(audio_data).mean()
-
-            # Live waveform update on floating pill
-            if hasattr(self, "pill") and self.pill:
-                norm = min(1.0, max(0.0, (volume - self.noise_floor) / max(600, self.speech_threshold - self.noise_floor + 200)))
-                self.pill.update_volume(norm)
-
-            # Dynamic voice detection based on calibrated threshold
-            if volume > self.speech_threshold:
-                talking_started = True
-                silent_chunks = 0
-            elif talking_started:
-                silent_chunks += 1
-
-            if talking_started and silent_chunks > max_silent_chunks:
-                break
-            if not talking_started and i > timeout_chunks:
-                break
-
-        if hasattr(self, "pill") and self.pill:
-            self.pill.set_state("processing")
-        else:
-            self.play_chime("end")
-
-        if not talking_started or not frames:
-            if hasattr(self, "pill") and self.pill:
-                self.pill.set_state("idle")
-            return np.zeros(0, dtype=np.int16)
-
-        return np.concatenate([np.frombuffer(f, dtype=np.int16) for f in frames])
-
-    def transcribe(self, audio_data: np.ndarray) -> str:
-        """Transcribe speech using Parakeet-EOU INT8, with Whisper fallback."""
-        if len(audio_data) < RATE * 0.4:
-            return ""
-
-        # Try Parakeet first
-        if self.stt is not None:
-            try:
-                t0 = time.time()
-                text = self.stt.transcribe(audio_data)
-                stt_time = time.time() - t0
-                if text.strip():
-                    print(f"⚡ STT (Parakeet-EOU INT8): \"{text}\" ({stt_time:.2f}s)")
-                    return text.strip()
-            except Exception as e:
-                print(f"[Notice] Parakeet decode issue ({e}), trying Whisper...")
-
-        # Whisper fallback
         try:
-            whisper = self.get_whisper()
-            import tempfile, wave
-            with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as tf:
-                wav_path = tf.name
-            with wave.open(wav_path, "wb") as wf:
-                wf.setnchannels(CHANNELS)
-                wf.setsampwidth(self.audio.get_sample_size(FORMAT))
-                wf.setframerate(RATE)
-                wf.writeframes(audio_data.tobytes())
-
-            segments, _ = whisper.transcribe(wav_path, beam_size=1)
-            whisper_text = "".join([s.text for s in segments]).strip()
+            asyncio.run(generate_speech())
+            if os.path.exists(temp_audio):
+                pygame.mixer.music.load(temp_audio)
+                pygame.mixer.music.play()
+                while pygame.mixer.music.get_busy():
+                    time.sleep(0.04)
+                pygame.mixer.music.unload()
+                try:
+                    os.remove(temp_audio)
+                except Exception:
+                    pass
+        except Exception:
+            # SAPI fallback
             try:
-                os.remove(wav_path)
+                if self.sapi_engine:
+                    self.sapi_engine.say(clean_text)
+                    self.sapi_engine.runAndWait()
             except Exception:
                 pass
-            if whisper_text:
-                print(f"⚡ STT (Whisper fallback): \"{whisper_text}\"")
-                return whisper_text
-        except Exception:
-            pass
+        finally:
+            # Echo prevention
+            time.sleep(0.35)
+            try:
+                while self.mic_stream.get_read_available() > 0:
+                    self.mic_stream.read(self.mic_stream.get_read_available(), exception_on_overflow=False)
+            except Exception:
+                pass
+            if self.oww is not None:
+                self.oww.reset()
+            while not self.command_queue.empty():
+                try:
+                    self.command_queue.get_nowait()
+                except queue.Empty:
+                    break
+            self.is_speaking.clear()
+            if self.pill:
+                self.pill.set_state("idle")
 
-        return ""
-
-    def wake_word_listener(self):
-        """Background thread constantly listening for 'Hey Jarvis' on mic stream."""
+    def _wake_word_listener(self):
+        """Continuous mic listening for 'Hey Jarvis'."""
         if self.oww is None:
             return
 
-        while True:
+        while self.is_running:
             try:
-                if not self.is_listening.is_set() and not self.is_speaking.is_set():
+                if self.wake_word_enabled and not self.is_listening.is_set() and not self.is_speaking.is_set():
                     data = self.mic_stream.read(CHUNK, exception_on_overflow=False)
                     audio_data = np.frombuffer(data, dtype=np.int16)
-                    vol = int(np.abs(audio_data).mean())
                     prediction = self.oww.predict(audio_data)
-                    max_score = max(prediction.values()) if prediction else 0.0
+                    score = max(prediction.values()) if prediction else 0.0
 
-                    # Real-time mic volume and wake score in title bar
-                    title = f"Jarvis AI | Mic Vol: {vol} | Hey Jarvis: {max_score:.2f} | Ctrl+Shift+Space to talk"
-                    ctypes.windll.kernel32.SetConsoleTitleW(title)
-
-                    if max_score > WAKE_THRESHOLD:
-                        print(f"\n[Wake Word Detected: Hey Jarvis (score={max_score:.2f})]")
+                    if score > WAKE_THRESHOLD:
+                        print(f"\n[Wake Word: Hey Jarvis (score={score:.2f})]")
                         self.oww.reset()
                         self.is_listening.set()
-                        self.command_queue.put("WAKE_WORD")
+                        self.command_queue.put("TRIGGER")
                 else:
                     time.sleep(0.08)
             except OSError:
@@ -788,71 +873,81 @@ class FastAgent:
             except Exception:
                 time.sleep(0.5)
 
-    def run(self):
-        """Main assistant lifecycle loop."""
-        winsound.PlaySound("SystemAsterisk", winsound.SND_ALIAS)
+    def _worker_loop(self):
+        """Background loop executing queued voice triggers."""
+        while self.is_running:
+            try:
+                trigger = self.command_queue.get(timeout=0.2)
+            except queue.Empty:
+                continue
 
-        print("\n" + "=" * 60)
-        print(" Jarvis is Online.")
-        print(" - Say 'Hey Jarvis' or press 'Ctrl+Shift+Space' / 'Ctrl+Alt+J'")
-        print(" - Or type your command below and press Enter.")
-        print("=" * 60 + "\n")
+            if trigger == "TRIGGER":
+                audio_data = self.record_audio()
+                self.is_listening.clear()
 
-        # Start system tray icon
-        tray_thread = threading.Thread(target=self.setup_tray, daemon=True)
-        tray_thread.start()
+                if len(audio_data) > 0:
+                    user_text = self.transcribe(audio_data)
+                    if user_text:
+                        self.execute_command_pipeline(user_text, source="voice")
+                else:
+                    if self.pill:
+                        self.pill.set_state("idle")
 
-        # Check if launched minimized/silent
-        if "--minimized" in sys.argv or "--silent" in sys.argv:
-            hwnd = ctypes.windll.kernel32.GetConsoleWindow()
-            if hwnd:
-                ctypes.windll.user32.ShowWindow(hwnd, 0)
+    def _terminal_input_loop(self):
+        """Console keyboard input loop when --console is active."""
+        while self.is_running:
+            try:
+                cmd = input().strip()
+                if cmd and not self.is_listening.is_set():
+                    self.execute_command_pipeline(cmd, source="typed")
+            except (EOFError, KeyboardInterrupt):
+                break
 
-        # Start wake word listener thread
-        listener_thread = threading.Thread(target=self.wake_word_listener, daemon=True)
-        listener_thread.start()
-
-        # Keyboard terminal input thread
-        def terminal_input_worker():
-            while True:
-                try:
-                    cmd = input().strip()
-                    if cmd and not self.is_listening.is_set():
-                        self.execute_command_pipeline(cmd, source="typed")
-                except (EOFError, KeyboardInterrupt):
-                    break
-
-        t_input = threading.Thread(target=terminal_input_worker, daemon=True)
-        t_input.start()
-
+    def shutdown(self):
+        """Gracefully terminate Jarvis agent and release hardware resources."""
+        self.is_running = False
         try:
-            while True:
-                try:
-                    trigger = self.command_queue.get(timeout=0.2)
-                except queue.Empty:
-                    continue
+            if hasattr(self, "dashboard") and self.dashboard and self.dashboard.root:
+                self.dashboard.root.after(0, self.dashboard.root.quit)
+        except Exception:
+            pass
 
-                if trigger in ("HOTKEY", "WAKE_WORD"):
-                    ctypes.windll.kernel32.SetConsoleTitleW("Jarvis AI | 🎙️ Listening...")
-                    audio_data = self.record_audio()
-                    self.is_listening.clear()
-
-                    if len(audio_data) > 0:
-                        ctypes.windll.kernel32.SetConsoleTitleW("Jarvis AI | 🧠 Thinking...")
-                        user_text = self.transcribe(audio_data)
-                        if user_text:
-                            self.execute_command_pipeline(user_text, source="voice")
-
-                    ctypes.windll.kernel32.SetConsoleTitleW("Jarvis AI | Ready")
-
-        except KeyboardInterrupt:
-            print("\nShutting down Jarvis...")
-        finally:
+    def _cleanup_resources(self):
+        """Release audio hardware and tray icon."""
+        try:
+            if hasattr(self, "tray_icon") and self.tray_icon:
+                self.tray_icon.stop()
+        except Exception:
+            pass
+        try:
+            if hasattr(self, "pill") and self.pill:
+                self.pill.stop()
+        except Exception:
+            pass
+        try:
             self.mic_stream.stop_stream()
             self.mic_stream.close()
             self.audio.terminate()
+        except Exception:
+            pass
+
+    def run(self):
+        """Main UI thread execution loop."""
+        try:
+            self.dashboard.root.mainloop()
+        except KeyboardInterrupt:
+            pass
+        finally:
+            self._cleanup_resources()
+            os._exit(0)
 
 
 if __name__ == "__main__":
+    # Check if Jarvis is already running; if so, open dashboard and exit cleanly
+    if check_single_instance(IPC_PORT):
+        print("[OK] Jarvis is already running in background. Sent signal to open dashboard.")
+        sys.exit(0)
+
+    # First instance: run full background agent
     agent = FastAgent()
     agent.run()

@@ -48,7 +48,8 @@ def _make_sound_cue(notes: list, sr: int = 44100):
 
 
 class FloatingVoicePill:
-    def __init__(self):
+    def __init__(self, parent=None):
+        self.parent = parent
         self.state = "idle"  # idle, recording, processing, speaking
         self.current_level = 0.0
         self.target_level = 0.0
@@ -66,9 +67,15 @@ class FloatingVoicePill:
             self.start_cue = None
             self.stop_cue = None
 
-        # Start Tkinter thread
-        self.thread = threading.Thread(target=self._run_tk, daemon=True)
-        self.thread.start()
+        self._is_visible = False
+        self._last_active_time = 0.0
+
+        if self.parent is not None:
+            self._init_ui(self.parent)
+        else:
+            # Start Tkinter thread
+            self.thread = threading.Thread(target=self._run_tk, daemon=True)
+            self.thread.start()
 
     def play_sfx(self, cue_type: str = "start"):
         """Play OpenWhispr harmonic chime."""
@@ -93,8 +100,15 @@ class FloatingVoicePill:
         """Update live audio level (0.0 to 1.0)."""
         self.target_level = max(0.0, min(1.0, vol))
 
-    def _run_tk(self):
-        self.root = tk.Tk()
+    def stop(self):
+        """Cleanly destroy overlay widget."""
+        self.queue.put(("destroy", None))
+
+    def _init_ui(self, parent_widget):
+        if parent_widget is not None:
+            self.root = tk.Toplevel(parent_widget)
+        else:
+            self.root = tk.Tk()
         self.root.title("Jarvis Voice Pill")
         self.root.overrideredirect(True)
         self.root.attributes("-topmost", True)
@@ -127,6 +141,10 @@ class FloatingVoicePill:
         )
         self.canvas.pack(fill="both", expand=True)
 
+        # Start hidden by default
+        self.root.withdraw()
+        self._is_visible = False
+
         # Make widget draggable
         def start_drag(event):
             self._drag_start_x = event.x
@@ -142,6 +160,9 @@ class FloatingVoicePill:
 
         # Start animation ticker
         self._animate()
+
+    def _run_tk(self):
+        self._init_ui(None)
         self.root.mainloop()
 
     def _draw_pill_bg(self, w, h, fill="#18181b", outline="#27272a"):
@@ -171,6 +192,24 @@ class FloatingVoicePill:
             msg, val = self.queue.get_nowait()
             if msg == "state":
                 self.state = val
+            elif msg == "destroy":
+                try:
+                    self.root.destroy()
+                except Exception:
+                    pass
+                return
+
+        # Manage auto-show and auto-hide
+        if self.state in ("recording", "processing", "speaking"):
+            if not self._is_visible:
+                self.root.deiconify()
+                self._is_visible = True
+            self._last_active_time = time.time()
+        else:
+            if self._is_visible:
+                if time.time() - self._last_active_time > 0.6:
+                    self.root.withdraw()
+                    self._is_visible = False
 
         self.canvas.delete("all")
         self.current_level += (self.target_level - self.current_level) * 0.35
