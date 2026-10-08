@@ -12,6 +12,9 @@ models/
 *.wav
 *.mp3
 
+# Secrets and config
+.env
+
 # Editor folders
 .vscode/
 .idea/

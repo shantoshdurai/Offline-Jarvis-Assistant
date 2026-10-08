@@ -32,10 +32,52 @@ def get_chrome_exe():
             return p
     return None
 
+def play_video(query_or_target, browser=None):
+    """Search for the top video on YouTube and immediately open and play it directly."""
+    cleaned_query = query_or_target.strip().strip("'\"")
+    for prefix in ["play ", "watch ", "listen to "]:
+        if cleaned_query.lower().startswith(prefix):
+            cleaned_query = cleaned_query[len(prefix):].strip()
+
+    search_url = f"https://www.youtube.com/results?search_query={urllib.parse.quote(cleaned_query)}"
+    target_url = search_url
+    try:
+        req = urllib.request.Request(
+            search_url,
+            headers={"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"}
+        )
+        with urllib.request.urlopen(req, timeout=5) as resp:
+            html = resp.read().decode("utf-8", errors="ignore")
+        vids = re.findall(r'/watch\?v=([a-zA-Z0-9_-]{11})', html)
+        if vids:
+            target_url = f"https://www.youtube.com/watch?v={vids[0]}"
+    except Exception:
+        pass
+
+    browser_lower = (browser or "").lower()
+    if "firefox" in browser_lower:
+        ff = get_firefox_exe()
+        if ff:
+            subprocess.Popen([ff, target_url])
+            return f"Playing '{cleaned_query}' on YouTube in Firefox."
+    elif "chrome" in browser_lower:
+        ch = get_chrome_exe()
+        if ch:
+            subprocess.Popen([ch, target_url])
+            return f"Playing '{cleaned_query}' on YouTube in Chrome."
+
+    webbrowser.open(target_url)
+    return f"Playing '{cleaned_query}' on YouTube: {target_url}"
+
 def open_url(url_or_target, browser=None):
     """Opens a website or URL in Firefox, Chrome, or default browser."""
     url = url_or_target.strip().strip("'\"")
-    if url.lower() == "youtube":
+    if "youtube.com/results?search_query=" in url:
+        q = urllib.parse.unquote(url.split("search_query=")[-1])
+        return play_video(q, browser=browser)
+    elif url.lower().startswith("play "):
+        return play_video(url[5:], browser=browser)
+    elif url.lower() == "youtube":
         url = "https://www.youtube.com"
     elif url.lower() == "leetcode":
         url = "https://leetcode.com/problemset/"
@@ -565,6 +607,8 @@ def read_file_content(file_path):
 
 AVAILABLE_TOOLS = {
     "open_url": open_url,
+    "play_video": play_video,
+    "play_youtube": play_video,
     "open_leetcode": open_leetcode,
     "open_app": open_app,
     "take_screenshot": take_screenshot,
@@ -690,14 +734,17 @@ def detect_and_run_intent(text):
             res = adjust_volume("mute")
             return True, f"[Action: {res}]", "Toggled volume mute for you.", False
 
-    # 5. YouTube Intent (clean extraction, avoids treating browser or filler as search, frank fallback)
-    if "youtube" in t and any(w in t for w in ["open", "play", "launch", "start", "show", "watch", "want", "search"]):
+    # 5. YouTube Intent (clean extraction, direct playback vs search, frank fallback)
+    is_play_music = t.startswith("play ") and any(w in t for w in ["music", "song", "theme", "track", "audio", "video", "ost", "lofi", "beats", "remix"])
+    if ("youtube" in t and any(w in t for w in ["open", "play", "launch", "start", "show", "watch", "want", "search"])) or is_play_music:
         clean = re.sub(r'^(hey\s+jarvis\s*,?\s*|jarvis\s*,?\s*)', '', t)
         m = re.search(r'play\s+(.+?)(?:\s+on|\s+in)?\s+youtube', clean)
         if not m:
             m = re.search(r'(?:search\s+(?:on\s+)?youtube\s+for|youtube\s+search\s+(?:for\s+)?)(.+)', clean)
         if not m:
             m = re.search(r'open\s+youtube(?:\s+(?:and|to)\s+(?:search|play))?\s+(.+)', clean)
+        if not m and is_play_music:
+            m = re.search(r'play\s+(.+)', clean)
 
         query = m.group(1).strip() if m else ""
         query = re.sub(r'\b(in\s+my\s+browser|in\s+browser|in\s+firefox|in\s+chrome|please|for\s+me|tab|video|videos)\b', '', query).strip()
@@ -713,10 +760,15 @@ def detect_and_run_intent(text):
             speech = "I opened YouTube for you. To be frank, I wasn't sure what specific video or search you wanted, so I opened the homepage for you."
             return True, f"[Action: {res}]", speech, False
         else:
-            target = f"https://www.youtube.com/results?search_query={urllib.parse.quote(query)}"
-            res = open_url(target, browser=browser)
-            speech = f"Searching YouTube for {query}."
-            return True, f"[Action: Opened YouTube search for '{query}' ({target})]", speech, False
+            if any(w in t for w in ["play", "watch", "listen", "song", "music", "theme", "track", "lofi"]):
+                res = play_video(query, browser=browser)
+                speech = f"Playing {query} on YouTube."
+                return True, f"[Action: {res}]", speech, False
+            else:
+                target = f"https://www.youtube.com/results?search_query={urllib.parse.quote(query)}"
+                res = open_url(target, browser=browser)
+                speech = f"Searching YouTube for {query}."
+                return True, f"[Action: Opened YouTube search for '{query}' ({target})]", speech, False
 
     # 6. LeetCode Intent (smart GraphQL daily resolver, slug verification, frank fallback)
     if "leetcode" in t and any(w in t for w in ["open", "show", "go to", "solve", "want", "do", "find", "challenge"]):
