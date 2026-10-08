@@ -75,7 +75,7 @@ else:
 OPENROUTER_API_KEY = os.getenv("OPENROUTER_API_KEY", "")
 OPENROUTER_MODEL = os.getenv("OPENROUTER_MODEL", "deepseek/deepseek-v4.1-flash")
 FALLBACK_MODEL = os.getenv("FALLBACK_MODEL", "openrouter/free")
-WAKE_THRESHOLD = float(os.getenv("WAKE_THRESHOLD", "0.25"))
+WAKE_THRESHOLD = float(os.getenv("WAKE_THRESHOLD", "0.18"))
 
 # Audio settings
 FORMAT = pyaudio.paInt16
