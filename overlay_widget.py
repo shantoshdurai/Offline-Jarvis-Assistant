@@ -14,7 +14,6 @@ import time
 import math
 import threading
 import queue
-import collections
 import tkinter as tk
 import numpy as np
 import pygame
@@ -58,11 +57,6 @@ class FloatingVoicePill:
         self.spin_angle = 0
         self.is_running = True
         self.queue = queue.Queue()
-
-        # OpenWhispr authentic 11-bar equalizer state
-        self.bar_history = collections.deque([0.0] * 11, maxlen=11)
-        self.displayed_bars = [0.0] * 11
-        self._last_bar_shift = time.time()
 
         # Initialize Pygame Mixer for sound cues
         try:
@@ -185,14 +179,14 @@ class FloatingVoicePill:
         self.canvas.create_line(2 + r, 2, w - 2 - r, 2, fill=outline, width=1.5)
         self.canvas.create_line(2 + r, h - 2, w - 2 - r, h - 2, fill=outline, width=1.5)
 
-    def _draw_mic_icon(self, cx, cy, color="#ffffff"):
-        # Circular mic badge
+    def _draw_mic_icon(self, cx, cy):
+        # White circular mic badge
         r_outer = 13
-        self.canvas.create_oval(cx - r_outer, cy - r_outer, cx + r_outer, cy + r_outer, outline=color, width=1.5)
+        self.canvas.create_oval(cx - r_outer, cy - r_outer, cx + r_outer, cy + r_outer, outline="#ffffff", width=1.5)
         # Inner vertical sound bars inside circle
-        self.canvas.create_line(cx - 4, cy - 4, cx - 4, cy + 4, fill=color, width=1.5)
-        self.canvas.create_line(cx, cy - 7, cx, cy + 7, fill=color, width=2)
-        self.canvas.create_line(cx + 4, cy - 4, cx + 4, cy + 4, fill=color, width=1.5)
+        self.canvas.create_line(cx - 4, cy - 4, cx - 4, cy + 4, fill="#ffffff", width=1.5)
+        self.canvas.create_line(cx, cy - 7, cx, cy + 7, fill="#ffffff", width=2)
+        self.canvas.create_line(cx + 4, cy - 4, cx + 4, cy + 4, fill="#ffffff", width=1.5)
 
     def _animate(self):
         if not self.is_running:
@@ -216,110 +210,108 @@ class FloatingVoicePill:
                     pass
                 return
 
-
-        now = time.time()
         # Manage auto-show and auto-hide
         if self.state in ("recording", "processing", "speaking", "listening"):
             if not self._is_visible:
                 self.root.deiconify()
                 self._is_visible = True
-            self._last_active_time = now
+            self._last_active_time = time.time()
         else:
             if self._is_visible:
-                if now - self._last_active_time > 0.4:
+                if time.time() - self._last_active_time > 0.5:
                     self.root.withdraw()
                     self._is_visible = False
 
         self.canvas.delete("all")
-        self.current_level += (self.target_level - self.current_level) * 0.4
+        self.current_level += (self.target_level - self.current_level) * 0.35
 
-        # Shift audio levels through the 11 equalizer history slots every ~75ms (OpenWhispr $s = 80ms)
-        if now - self._last_bar_shift >= 0.075:
-            self._last_bar_shift = now
-            push_val = self.current_level if self.current_level >= 0.02 else 0.0
-            self.bar_history.append(push_val)
+        if self.state == "recording":
+            # Expand to 110px pill with animated waveform
+            w = self.w_rec
+            self._draw_pill_bg(w, self.h, fill="#16161a", outline="#2e2e38")
+            self._draw_mic_icon(20, self.h / 2)
 
-        # Smoothly interpolate each displayed bar height towards target
-        for i in range(11):
-            target_b = self.bar_history[i]
-            self.displayed_bars[i] += (target_b - self.displayed_bars[i]) * 0.35
+            # Draw 8 animated waveform equalizer bars
+            num_bars = 8
+            start_x = 42
+            bar_gap = 7
+            max_bar_h = 22
+            min_bar_h = 4
+            mid_y = self.h / 2
 
-        w = self.w_rec
-        mid_y = self.h / 2
-        start_x = 42
-        end_x = 102
-        step = (end_x - start_x) / 10  # 6.0px per bar
-
-        if self.state in ("recording", "listening", "speaking"):
-            if self.state == "speaking":
-                outline_col = "#10b981"
-                icon_col = "#10b981"
-                bar_col = "#10b981"
-                silent_col = "#047857"
-            elif self.state == "recording":
-                outline_col = "#38bdf8"
-                icon_col = "#ffffff"
-                bar_col = "#38bdf8"
-                silent_col = "#64748b"
-            else:  # listening
-                outline_col = "#0ea5e9"
-                icon_col = "#ffffff"
-                bar_col = "#0ea5e9"
-                silent_col = "#64748b"
-
-            self._draw_pill_bg(w, self.h, fill="#16161a", outline=outline_col)
-            self._draw_mic_icon(20, mid_y, color=icon_col)
-
-            # Draw the 11 OpenWhispr equalizer bars (4px resting height when silent, dynamic to 22px when speaking)
-            for i in range(11):
-                bx = start_x + i * step
-                lvl = max(0.0, min(1.0, self.displayed_bars[i]))
-                if lvl < 0.02:
-                    bar_h = 4.0
-                    col = silent_col
-                else:
-                    zs = min(1.0, (lvl * 8.0) ** 0.75)
-                    bar_h = 4.0 + zs * 18.0
-                    col = bar_col
-
-                y_top = mid_y - bar_h / 2.0
-                y_bot = mid_y + bar_h / 2.0
+            t_ms = time.time() * 10
+            for i in range(num_bars):
+                bx = start_x + i * bar_gap
+                # Smooth sinusoidal variation driven by volume level
+                wave_factor = 0.5 + 0.5 * math.sin(t_ms + i * 0.8)
+                bar_h = min_bar_h + (max_bar_h - min_bar_h) * self.current_level * wave_factor
                 self.canvas.create_line(
-                    bx, y_top, bx, y_bot,
-                    fill=col,
+                    bx, mid_y - bar_h / 2,
+                    bx, mid_y + bar_h / 2,
+                    fill="#f4f4f5",
                     width=2.5,
+                    capstyle="round"
+                )
+
+        elif self.state == "listening":
+            # 110px pill showing gentle breathing wave bars (attentive follow-up mode)
+            w = self.w_rec
+            self._draw_pill_bg(w, self.h, fill="#16161a", outline="#0284c7")
+            self._draw_mic_icon(20, self.h / 2)
+
+            num_bars = 6
+            start_x = 44
+            bar_gap = 9
+            mid_y = self.h / 2
+            t_ms = time.time() * 4
+            for i in range(num_bars):
+                bx = start_x + i * bar_gap
+                pulse = 3 + 5 * (0.5 + 0.5 * math.sin(t_ms - i * 0.6))
+                self.canvas.create_line(
+                    bx, mid_y - pulse,
+                    bx, mid_y + pulse,
+                    fill="#38bdf8",
+                    width=2,
                     capstyle="round"
                 )
 
         elif self.state == "processing":
-            # Thinking / generating state: Pill stays expanded at 114px with high-tech glowing wave across the 11 bars
-            outline_col = "#00e5ff"
-            self._draw_pill_bg(w, self.h, fill="#16161a", outline=outline_col)
-            self._draw_mic_icon(20, mid_y, color="#00e5ff")
+            # Circular 40x40 orb with rotating cyan spinner ring
+            w = self.w_idle
+            cx, cy = w / 2, self.h / 2
+            r = 18
+            self.canvas.create_oval(cx - r, cy - r, cx + r, cy + r, fill="#18181b", outline="#27272a", width=1.5)
+            self._draw_mic_icon(cx, cy)
 
-            # Sweeping shimmer pulse across 11 bars
-            t_wave = now * 7.5
-            for i in range(11):
-                bx = start_x + i * step
-                phase = math.sin(t_wave - i * 0.55)
-                bar_h = 5.0 + 11.0 * (0.5 + 0.5 * phase)
-                y_top = mid_y - bar_h / 2.0
-                y_bot = mid_y + bar_h / 2.0
-                self.canvas.create_line(
-                    bx, y_top, bx, y_bot,
-                    fill="#00e5ff",
-                    width=2.5,
-                    capstyle="round"
-                )
+            # Rotating glowing cyan arc
+            self.spin_angle = (self.spin_angle + 14) % 360
+            self.canvas.create_arc(
+                cx - r + 1, cy - r + 1, cx + r - 1, cy + r - 1,
+                start=self.spin_angle,
+                extent=100,
+                outline="#00dcff",
+                width=2.5,
+                style="arc"
+            )
+
+        elif self.state == "speaking":
+            # Glowing cyan/green pulsing orb
+            w = self.w_idle
+            cx, cy = w / 2, self.h / 2
+            r = 18
+            pulse = 1.0 + 0.15 * math.sin(time.time() * 8)
+            self.canvas.create_oval(cx - r*pulse, cy - r*pulse, cx + r*pulse, cy + r*pulse, fill="#18181b", outline="#00e676", width=2)
+            self._draw_mic_icon(cx, cy)
 
         else: # idle
-            # Subtle dark resting circle
-            w_idle = self.w_idle
-            cx, cy = w_idle / 2, mid_y
+            # Subtle dark orb
+            w = self.w_idle
+            cx, cy = w / 2, self.h / 2
             r = 17
             self.canvas.create_oval(cx - r, cy - r, cx + r, cy + r, fill="#121215", outline="#222226", width=1.5)
-            self._draw_mic_icon(cx, cy, color="#475569")
+            self._draw_mic_icon(cx, cy)
 
         # Loop at ~35 FPS for buttery smooth animation
         self.root.after(28, self._animate)
+
 
