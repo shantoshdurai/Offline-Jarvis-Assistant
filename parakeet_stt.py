@@ -226,3 +226,66 @@ class ParakeetEOU:
 
         text = "".join(all_pieces).replace("\u2581", " ").strip()
         return text
+
+
+class ParakeetTDT:
+    """NVIDIA Parakeet-TDT 0.6B (622MB) via sherpa-onnx.
+    Token-and-duration transducer with sub-300ms inference and full punctuation.
+    """
+    def __init__(self, model_dir: Optional[str] = None):
+        import sherpa_onnx
+        if not model_dir:
+            candidates = [
+                os.path.join(os.path.expanduser("~"), ".cache", "openwhispr", "parakeet-models", "parakeet-tdt-0.6b-v3"),
+                os.path.join(os.path.dirname(__file__), "models", "parakeet-tdt-0.6b-v3"),
+                os.path.join(os.getcwd(), "models", "parakeet-tdt-0.6b-v3"),
+            ]
+            for c in candidates:
+                if os.path.exists(os.path.join(c, "encoder.int8.onnx")):
+                    model_dir = c
+                    break
+        if not model_dir or not os.path.exists(os.path.join(model_dir, "encoder.int8.onnx")):
+            raise FileNotFoundError(f"Parakeet-TDT model directory not found: {model_dir}")
+
+        self.model_dir = model_dir
+        self.recognizer = sherpa_onnx.OfflineRecognizer.from_transducer(
+            encoder=os.path.join(model_dir, "encoder.int8.onnx"),
+            decoder=os.path.join(model_dir, "decoder.int8.onnx"),
+            joiner=os.path.join(model_dir, "joiner.int8.onnx"),
+            tokens=os.path.join(model_dir, "tokens.txt"),
+            num_threads=4,
+            sample_rate=16000,
+            feature_dim=80,
+            model_type="nemo_transducer",
+            provider="cpu"
+        )
+
+    def transcribe(self, audio_samples: np.ndarray, on_partial: Optional[Callable[[str], None]] = None) -> str:
+        """Transcribes complete audio array (float32 or int16, 16kHz)."""
+        if audio_samples.dtype == np.int16:
+            audio_samples = audio_samples.astype(np.float32) / 32768.0
+
+        stream = self.recognizer.create_stream()
+        stream.accept_waveform(16000, audio_samples)
+        self.recognizer.decode_stream(stream)
+        text = stream.result.text.strip()
+        if on_partial and text:
+            on_partial(text)
+        return text
+
+
+def get_best_stt_engine():
+    """Discovers and returns the fastest, highest-accuracy STT engine available."""
+    try:
+        tdt = ParakeetTDT()
+        print("[OK] Active STT: NVIDIA Parakeet-TDT 0.6B (622MB OpenWhispr model, 300ms latency)")
+        return tdt
+    except Exception as e:
+        print(f"[Notice] Parakeet-TDT not found ({e}). Falling back to Parakeet-EOU 120M.")
+        try:
+            eou = ParakeetEOU()
+            print("[OK] Active STT: NVIDIA Parakeet-EOU INT8 (120MB)")
+            return eou
+        except Exception as e2:
+            print(f"[Notice] Parakeet-EOU not found ({e2}). Faster-Whisper active as fallback.")
+            return None

@@ -137,6 +137,19 @@ def test_persistent_memory_lifecycle():
     print("  Injected Context:", ctx)
     assert "Firefox" in ctx
     assert "Shantosh" in ctx
+
+    # 6. Direct note & fact CRUD operations (used by Dashboard GUI)
+    note_added = mm.add_direct_note("Deploy Jarvis 2.0 to GitHub")
+    assert note_added.get("text") == "Deploy Jarvis 2.0 to GitHub"
+    del_note_ok = mm.delete_note_by_id(note_added.get("id"))
+    assert del_note_ok is True
+
+    fact_added = mm.add_direct_fact("favorite_editor", "VS Code")
+    assert fact_added is True
+    assert mm.load_memory()["facts"]["favorite_editor"] == "VS Code"
+    del_fact_ok = mm.delete_fact_by_key("favorite_editor")
+    assert del_fact_ok is True
+    assert "favorite_editor" not in mm.load_memory()["facts"]
     print("Persistent Memory Suite: 100% Passed.")
 
 
@@ -192,6 +205,17 @@ def test_tool_dispatch():
     print("Tool Execution Suite: 100% Passed.")
 
 
+def test_stt_engine_factory():
+    """Evaluates STT engine discovery and verifies Parakeet-TDT 622MB engine."""
+    print("\n--- Test Suite 5: STT Engine Discovery & Model Factory ---")
+    from parakeet_stt import get_best_stt_engine, ParakeetTDT
+    engine = get_best_stt_engine()
+    assert engine is not None, "Failed to discover an active STT engine"
+    print(f"  Discovered Engine: {engine.__class__.__name__}")
+    assert isinstance(engine, ParakeetTDT), f"Expected ParakeetTDT, got {engine.__class__.__name__}"
+    print("STT Engine Factory Suite: 100% Passed.")
+
+
 if __name__ == "__main__":
     print("============================================================")
     print("  Jarvis AI Assistant — Comprehensive Evaluation Suite")
@@ -209,7 +233,8 @@ if __name__ == "__main__":
     test_voice_tts_sanitizer(clean_spoken_text)
     test_persistent_memory_lifecycle()
     test_tool_dispatch()
+    test_stt_engine_factory()
 
     print("\n============================================================")
-    print("  ALL 4 EVALUATION SUITES PASSED (100% SUCCESS RATE) 🚀")
+    print("  ALL 5 EVALUATION SUITES PASSED (100% SUCCESS RATE) 🚀")
     print("============================================================\n")

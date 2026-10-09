@@ -190,3 +190,52 @@ def get_memory_context_string() -> str:
     if not parts:
         return ""
     return "[Saved User Memory & Preferences]: " + ", ".join(parts)
+
+
+def delete_note_by_id(note_id: str) -> bool:
+    """Deletes a single note by unique ID."""
+    data = load_memory()
+    notes = data.get("notes", [])
+    new_notes = [n for n in notes if str(n.get("id")) != str(note_id)]
+    if len(new_notes) < len(notes):
+        data["notes"] = new_notes
+        save_memory_data(data)
+        return True
+    return False
+
+
+def delete_fact_by_key(fact_key: str) -> bool:
+    """Deletes a single fact by key name."""
+    data = load_memory()
+    facts = data.get("facts", {})
+    if fact_key in facts:
+        del facts[fact_key]
+        data["facts"] = facts
+        save_memory_data(data)
+        return True
+    return False
+
+
+def add_direct_note(note_text: str) -> Dict[str, Any]:
+    """Adds a note directly without requiring voice parsing keywords."""
+    data = load_memory()
+    clean = note_text.strip()
+    note_item = {
+        "id": str(int(time.time())),
+        "date": time.strftime("%Y-%m-%d %H:%M"),
+        "text": clean
+    }
+    data["notes"].append(note_item)
+    if len(data["notes"]) > 60:
+        data["notes"] = data["notes"][-60:]
+    save_memory_data(data)
+    return note_item
+
+
+def add_direct_fact(key: str, value: str) -> bool:
+    """Adds or updates a profile preference fact directly."""
+    data = load_memory()
+    k = re.sub(r'[^a-zA-Z0-9_]', '_', key.strip().lower())
+    data["facts"][k] = value.strip()
+    save_memory_data(data)
+    return True

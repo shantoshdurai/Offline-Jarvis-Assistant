@@ -54,7 +54,7 @@ CONFIG_FILE = os.path.join(BASE_DIR, "config.json")
 
 DEFAULT_CONFIG = {
     "follow_up_timeout": 10.0,
-    "silence_limit": 0.55,
+    "silence_limit": 1.2,
     "sfx_enabled": True,
     "voice_dismissal_enabled": True,
     "wake_word_enabled": True,
@@ -100,6 +100,7 @@ class JarvisDashboard:
         self.config = load_config()
         self.history = load_history()
         self.current_view = "home"
+        self._is_recording = False
 
         # Main Root Window
         self.root = ctk.CTk()
@@ -143,7 +144,7 @@ class JarvisDashboard:
             border_color="#1c1e28"
         )
         self.sidebar.grid(row=0, column=0, sticky="nsew")
-        self.sidebar.grid_rowconfigure(6, weight=1)  # Spacer push to bottom
+        self.sidebar.grid_rowconfigure(7, weight=1)  # Spacer push to bottom
 
         # App Brand Header
         self.brand_frame = ctk.CTkFrame(self.sidebar, fg_color="transparent")
@@ -222,15 +223,20 @@ class JarvisDashboard:
             text="⚡  Quick Actions",
             command=lambda: self.show_view("tools")
         )
-        self.nav_settings = self._create_nav_btn(
+        self.nav_memory = self._create_nav_btn(
             row=5,
+            text="🧠  Memory & Notes",
+            command=lambda: self.show_view("memory")
+        )
+        self.nav_settings = self._create_nav_btn(
+            row=6,
             text="⚙️  Settings",
             command=lambda: self.show_view("settings")
         )
 
         # Bottom Area of Sidebar
         self.bottom_sidebar = ctk.CTkFrame(self.sidebar, fg_color="transparent")
-        self.bottom_sidebar.grid(row=7, column=0, padx=14, pady=16, sticky="ew")
+        self.bottom_sidebar.grid(row=8, column=0, padx=14, pady=16, sticky="ew")
 
         # Stop Jarvis Button (Clean red 1-click shutdown)
         self.stop_btn = ctk.CTkButton(
@@ -294,10 +300,32 @@ class JarvisDashboard:
         self._build_home_view()
         self._build_chat_view()
         self._build_tools_view()
+        self._build_memory_view()
         self._build_settings_view()
 
         # Initial view selection
         self.show_view("home")
+
+    def set_recording_state(self, active: bool):
+        """Updates PTT button appearance dynamically when recording vs idle."""
+        self._is_recording = active
+        def _update():
+            if active:
+                self.header_ptt_btn.configure(
+                    text="🛑  Stop Speaking (Click to Finish)",
+                    fg_color="#dc2626",
+                    hover_color="#b91c1c"
+                )
+            else:
+                self.header_ptt_btn.configure(
+                    text="🎙️  Push to Talk (Ctrl+Shift+Space)",
+                    fg_color="#2563eb",
+                    hover_color="#1d4ed8"
+                )
+        try:
+            self.root.after(0, _update)
+        except Exception:
+            pass
 
     def _create_nav_btn(self, row: int, text: str, command: Callable) -> ctk.CTkButton:
         btn = ctk.CTkButton(
@@ -321,12 +349,14 @@ class JarvisDashboard:
             "home": self.nav_home,
             "chat": self.nav_chat,
             "tools": self.nav_tools,
+            "memory": self.nav_memory,
             "settings": self.nav_settings,
         }
         title_map = {
             "home": "Activity & Transcripts",
             "chat": "Live Assistant Chat",
             "tools": "Quick PC Actions",
+            "memory": "Persistent Memory & Notes",
             "settings": "System Settings",
         }
 
@@ -344,6 +374,8 @@ class JarvisDashboard:
         for key, frame in self.views.items():
             if key == name:
                 frame.grid(row=1, column=0, sticky="nsew")
+                if name == "memory":
+                    self.refresh_memory_view()
             else:
                 frame.grid_forget()
 
@@ -488,6 +520,25 @@ class JarvisDashboard:
             )
             tool_lbl.pack(side="left")
 
+        # Latency breakdown badge
+        lat = item.get("latency")
+        if lat and isinstance(lat, dict):
+            tot = lat.get("total", 0.0)
+            stt = lat.get("stt", 0.0)
+            llm = lat.get("llm", 0.0)
+            tts = lat.get("tts", 0.0)
+            lat_lbl = ctk.CTkLabel(
+                top_row,
+                text=f"⏱️ {tot:.2f}s (STT: {stt:.2f}s • LLM: {llm:.2f}s • TTS: {tts:.2f}s)",
+                font=ctk.CTkFont(size=10, weight="bold"),
+                text_color="#fef08a",
+                fg_color="#713f12",
+                corner_radius=6,
+                height=20,
+                padx=8
+            )
+            lat_lbl.pack(side="left", padx=8)
+
         # User Query
         user_text = item.get("user", "")
         user_lbl = ctk.CTkLabel(
@@ -522,7 +573,7 @@ class JarvisDashboard:
         text = self.search_entry.get()
         self._render_history_feed(filter_text=text)
 
-    def add_interaction(self, user_text: str, response: str, source: str = "voice", tool: str = ""):
+    def add_interaction(self, user_text: str, response: str, source: str = "voice", tool: str = "", latency: Optional[Dict[str, float]] = None):
         """Add an interaction item dynamically to history and feed."""
         entry = {
             "time": datetime.now().strftime("%I:%M %p"),
@@ -530,7 +581,8 @@ class JarvisDashboard:
             "source": source,
             "user": user_text,
             "response": response,
-            "tool": tool
+            "tool": tool,
+            "latency": latency
         }
         self.history.append(entry)
         save_history(self.history)
@@ -694,7 +746,256 @@ class JarvisDashboard:
             threading.Thread(target=lambda: self.on_send_chat(cmd), daemon=True).start()
 
     # ==========================================
-    # VIEW 4: SETTINGS VIEW
+    # VIEW 4: PERSISTENT MEMORY & NOTES
+    # ==========================================
+    def _build_memory_view(self):
+        mem_frame = ctk.CTkFrame(self.main_container, fg_color="transparent")
+        self.views["memory"] = mem_frame
+        mem_frame.grid_rowconfigure(1, weight=1)
+        mem_frame.grid_columnconfigure(0, weight=1)
+
+        # Top Bar: Search + Add Buttons
+        top_bar = ctk.CTkFrame(mem_frame, fg_color="transparent", height=38)
+        top_bar.grid(row=0, column=0, sticky="ew", pady=(0, 10))
+        top_bar.grid_columnconfigure(0, weight=1)
+
+        self.mem_search_entry = ctk.CTkEntry(
+            top_bar,
+            placeholder_text="🔍 Search saved profile facts, preferences, and notes...",
+            fg_color="#161720",
+            border_color="#232532",
+            text_color="#f8fafc",
+            placeholder_text_color="#64748b",
+            height=36,
+            corner_radius=8
+        )
+        self.mem_search_entry.grid(row=0, column=0, sticky="ew", padx=(0, 10))
+        self.mem_search_entry.bind("<KeyRelease>", lambda e: self.refresh_memory_view())
+
+        btn_add_note = ctk.CTkButton(
+            top_bar,
+            text="+ Add Note",
+            font=ctk.CTkFont(size=12, weight="bold"),
+            fg_color="#2563eb",
+            hover_color="#1d4ed8",
+            height=36,
+            width=100,
+            corner_radius=8,
+            command=self._dialog_add_note
+        )
+        btn_add_note.grid(row=0, column=1, padx=(0, 8))
+
+        btn_add_fact = ctk.CTkButton(
+            top_bar,
+            text="+ Add Fact",
+            font=ctk.CTkFont(size=12, weight="bold"),
+            fg_color="#059669",
+            hover_color="#047857",
+            height=36,
+            width=100,
+            corner_radius=8,
+            command=self._dialog_add_fact
+        )
+        btn_add_fact.grid(row=0, column=2)
+
+        # Scrollable Area for Facts and Notes
+        self.mem_scroll = ctk.CTkScrollableFrame(
+            mem_frame,
+            fg_color="#101117",
+            border_width=1,
+            border_color="#1c1d27",
+            corner_radius=10
+        )
+        self.mem_scroll.grid(row=1, column=0, sticky="nsew")
+        self.mem_scroll.grid_columnconfigure(0, weight=1)
+
+    def refresh_memory_view(self):
+        """Re-reads memory_manager JSON and dynamically renders cards."""
+        import memory_manager
+        data = memory_manager.load_memory()
+        facts = data.get("facts", {})
+        notes = data.get("notes", [])
+
+        # Clear existing items
+        for widget in self.mem_scroll.winfo_children():
+            widget.destroy()
+
+        search_query = ""
+        if hasattr(self, "mem_search_entry"):
+            search_query = self.mem_search_entry.get().strip().lower()
+
+        # SECTION 1: USER PROFILE & FACTS
+        s1 = ctk.CTkFrame(self.mem_scroll, fg_color="#161720", border_width=1, border_color="#232532", corner_radius=10)
+        s1.pack(fill="x", padx=10, pady=(6, 12))
+        s1.grid_columnconfigure(1, weight=1)
+
+        header1 = ctk.CTkFrame(s1, fg_color="transparent")
+        header1.pack(fill="x", padx=14, pady=(10, 6))
+        ctk.CTkLabel(
+            header1,
+            text="👤 User Profile & Learned Facts",
+            font=ctk.CTkFont(size=13, weight="bold"),
+            text_color="#f8fafc"
+        ).pack(side="left")
+        ctk.CTkLabel(
+            header1,
+            text=f"({len(facts)} active)",
+            font=ctk.CTkFont(size=11),
+            text_color="#64748b"
+        ).pack(side="left", padx=8)
+
+        filtered_facts = {
+            k: v for k, v in facts.items()
+            if not search_query or search_query in k.lower() or search_query in str(v).lower()
+        }
+
+        if not filtered_facts:
+            empty_lbl = ctk.CTkLabel(s1, text="No profile facts stored yet.", font=ctk.CTkFont(size=11), text_color="#64748b")
+            empty_lbl.pack(padx=14, pady=(4, 12), anchor="w")
+        else:
+            for k, v in filtered_facts.items():
+                row = ctk.CTkFrame(s1, fg_color="#101117", corner_radius=6)
+                row.pack(fill="x", padx=12, pady=3)
+                row.grid_columnconfigure(1, weight=1)
+
+                key_badge = ctk.CTkLabel(
+                    row,
+                    text=k.replace('_', ' ').title(),
+                    font=ctk.CTkFont(size=11, weight="bold"),
+                    fg_color="#1e293b",
+                    text_color="#38bdf8",
+                    corner_radius=4,
+                    padx=8,
+                    height=24
+                )
+                key_badge.pack(side="left", padx=(8, 8), pady=4)
+
+                val_lbl = ctk.CTkLabel(
+                    row,
+                    text=str(v),
+                    font=ctk.CTkFont(size=12),
+                    text_color="#e2e8f0",
+                    anchor="w"
+                )
+                val_lbl.pack(side="left", fill="x", expand=True, padx=4, pady=4)
+
+                del_btn = ctk.CTkButton(
+                    row,
+                    text="✕",
+                    font=ctk.CTkFont(size=11, weight="bold"),
+                    fg_color="transparent",
+                    text_color="#ef4444",
+                    hover_color="#3b1212",
+                    width=28,
+                    height=24,
+                    corner_radius=4,
+                    command=lambda fk=k: self._delete_fact(fk)
+                )
+                del_btn.pack(side="right", padx=6, pady=4)
+
+        # SECTION 2: SAVED NOTES & MEMORIES
+        s2 = ctk.CTkFrame(self.mem_scroll, fg_color="#161720", border_width=1, border_color="#232532", corner_radius=10)
+        s2.pack(fill="x", padx=10, pady=(0, 10))
+
+        header2 = ctk.CTkFrame(s2, fg_color="transparent")
+        header2.pack(fill="x", padx=14, pady=(10, 6))
+        ctk.CTkLabel(
+            header2,
+            text="📝 Saved Notes & Snippets",
+            font=ctk.CTkFont(size=13, weight="bold"),
+            text_color="#f8fafc"
+        ).pack(side="left")
+        ctk.CTkLabel(
+            header2,
+            text=f"({len(notes)} notes)",
+            font=ctk.CTkFont(size=11),
+            text_color="#64748b"
+        ).pack(side="left", padx=8)
+
+        filtered_notes = [
+            n for n in notes
+            if not search_query or search_query in n.get("text", "").lower() or search_query in n.get("date", "").lower()
+        ]
+
+        if not filtered_notes:
+            empty_lbl = ctk.CTkLabel(s2, text="No notes saved. Say 'Hey Jarvis, save note...' or click '+ Add Note'.", font=ctk.CTkFont(size=11), text_color="#64748b")
+            empty_lbl.pack(padx=14, pady=(4, 12), anchor="w")
+        else:
+            for note in reversed(filtered_notes):
+                nid = note.get("id")
+                ndate = note.get("date", "")
+                ntext = note.get("text", "")
+
+                nrow = ctk.CTkFrame(s2, fg_color="#101117", corner_radius=6)
+                nrow.pack(fill="x", padx=12, pady=4)
+
+                top_meta = ctk.CTkFrame(nrow, fg_color="transparent")
+                top_meta.pack(fill="x", padx=10, pady=(6, 2))
+
+                date_lbl = ctk.CTkLabel(
+                    top_meta,
+                    text=ndate,
+                    font=ctk.CTkFont(size=10),
+                    text_color="#64748b"
+                )
+                date_lbl.pack(side="left")
+
+                del_btn = ctk.CTkButton(
+                    top_meta,
+                    text="Delete",
+                    font=ctk.CTkFont(size=10),
+                    fg_color="#7f1d1d",
+                    hover_color="#991b1b",
+                    text_color="#fecaca",
+                    width=54,
+                    height=20,
+                    corner_radius=4,
+                    command=lambda nid=nid: self._delete_note(nid)
+                )
+                del_btn.pack(side="right")
+
+                content_lbl = ctk.CTkLabel(
+                    nrow,
+                    text=ntext,
+                    font=ctk.CTkFont(size=12),
+                    text_color="#e2e8f0",
+                    justify="left",
+                    anchor="w",
+                    wraplength=640
+                )
+                content_lbl.pack(fill="x", padx=10, pady=(2, 8))
+
+    def _delete_fact(self, key: str):
+        import memory_manager
+        memory_manager.delete_fact_by_key(key)
+        self.refresh_memory_view()
+
+    def _delete_note(self, note_id: str):
+        import memory_manager
+        memory_manager.delete_note_by_id(note_id)
+        self.refresh_memory_view()
+
+    def _dialog_add_note(self):
+        dialog = ctk.CTkInputDialog(text="Enter note content to remember:", title="Add Note")
+        val = dialog.get_input()
+        if val and val.strip():
+            import memory_manager
+            memory_manager.add_direct_note(val.strip())
+            self.refresh_memory_view()
+
+    def _dialog_add_fact(self):
+        d_key = ctk.CTkInputDialog(text="Enter preference name (e.g. favorite_browser, os, city):", title="Add Fact Key")
+        key = d_key.get_input()
+        if key and key.strip():
+            d_val = ctk.CTkInputDialog(text=f"Enter value for '{key.strip()}':", title="Add Fact Value")
+            val = d_val.get_input()
+            if val and val.strip():
+                import memory_manager
+                memory_manager.add_direct_fact(key.strip(), val.strip())
+                self.refresh_memory_view()
+
+    # ==========================================
+    # VIEW 5: SETTINGS VIEW
     # ==========================================
     def _build_settings_view(self):
         settings_frame = ctk.CTkScrollableFrame(
@@ -738,11 +1039,11 @@ class JarvisDashboard:
         row2.pack(fill="x", padx=14, pady=(6, 2))
         ctk.CTkLabel(row2, text="Silence Cutoff Speed:", font=ctk.CTkFont(size=12, weight="bold"), text_color="#f8fafc").pack(side="left")
 
-        curr_silence = self.config.get("silence_limit", 0.55)
-        curr_silence_str = f"{curr_silence:.2f}s" if curr_silence in (0.4, 0.55, 0.8, 1.2) else "0.55s"
+        curr_silence = self.config.get("silence_limit", 1.2)
+        curr_silence_str = f"{curr_silence:.2f}s"
         self.silence_seg = ctk.CTkSegmentedButton(
             row2,
-            values=["0.40s", "0.55s", "0.80s", "1.20s"],
+            values=["0.60s", "0.80s", "1.00s", "1.20s", "1.50s", "2.00s"],
             command=self._on_silence_change,
             selected_color="#2563eb",
             height=28
@@ -822,7 +1123,7 @@ class JarvisDashboard:
         row_m2 = ctk.CTkFrame(s3, fg_color="transparent")
         row_m2.pack(fill="x", padx=14, pady=8)
         ctk.CTkLabel(row_m2, text="Speech STT Engine:", font=ctk.CTkFont(size=12, weight="bold"), text_color="#f8fafc").pack(side="left")
-        ctk.CTkLabel(row_m2, text="NVIDIA Parakeet-EOU INT8 (Sub-50ms + Silence Trim)", font=ctk.CTkFont(size=12), text_color="#10b981").pack(side="right")
+        ctk.CTkLabel(row_m2, text="NVIDIA Parakeet-TDT 0.6B (622MB OpenWhispr, 300ms) / EOU", font=ctk.CTkFont(size=12), text_color="#10b981").pack(side="right")
 
         row_key = ctk.CTkFrame(s3, fg_color="transparent")
         row_key.pack(fill="x", padx=14, pady=(8, 14))

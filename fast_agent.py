@@ -76,7 +76,7 @@ except ImportError:
 
 # Local modules
 import tools
-from parakeet_stt import ParakeetEOU
+from parakeet_stt import ParakeetEOU, ParakeetTDT, get_best_stt_engine
 from overlay_widget import FloatingVoicePill
 from dashboard_gui import JarvisDashboard, load_config, save_config
 
@@ -554,10 +554,13 @@ class FastAgent:
         # Load persistent configuration
         self.config = load_config()
         self.follow_up_timeout = float(self.config.get("follow_up_timeout", 10.0))
-        self.silence_limit = float(self.config.get("silence_limit", 0.55))
+        self.silence_limit = float(self.config.get("silence_limit", 1.2))
         self.sfx_enabled = bool(self.config.get("sfx_enabled", True))
         self.voice_dismissal_enabled = bool(self.config.get("voice_dismissal_enabled", True))
         self.wake_word_enabled = bool(self.config.get("wake_word_enabled", True))
+
+        self.manual_stop_recording = threading.Event()
+        self.is_recording_active = False
 
         # 1. Initialize Dashboard GUI
         self.dashboard = JarvisDashboard(
@@ -578,13 +581,12 @@ class FastAgent:
             print(f"[Notice] Floating overlay error: {e}")
             self.pill = None
 
-        # 3. Speech Recognizer (NVIDIA Parakeet-EOU INT8)
+        # 3. Speech Recognizer (Prioritizes 622MB Parakeet-TDT, fallbacks to 120MB EOU or Whisper)
         self.stt = None
         try:
-            self.stt = ParakeetEOU()
-            print("[OK] Parakeet-EOU INT8 speech engine active")
+            self.stt = get_best_stt_engine()
         except Exception as e:
-            print(f"[Notice] Parakeet-EOU error ({e}). Whisper fallback active.")
+            print(f"[Notice] STT engine error ({e}). Whisper fallback active.")
 
         self.whisper_model = None
 
@@ -792,7 +794,12 @@ class FastAgent:
             print(f"[Warning] Hotkey setup issue: {e}")
 
     def trigger_voice(self):
-        """Triggers push-to-talk voice recording."""
+        """Triggers push-to-talk voice recording, or stops recording if currently active (toggle)."""
+        if self.is_recording_active:
+            print("[PTT Button Toggle] User clicked to finish speaking.")
+            self.manual_stop_recording.set()
+            return
+
         if not self.is_speaking.is_set() and not self.is_session_active:
             self.command_queue.put("TRIGGER")
 
@@ -818,70 +825,95 @@ class FastAgent:
         return self.whisper_model
 
     def record_audio(self, max_duration: float = 12.0, silence_limit: Optional[float] = None, start_timeout: Optional[float] = None) -> np.ndarray:
-        """Records voice with live waveform equalizer on floating pill."""
+        """Records voice with live waveform equalizer on floating pill, adaptive conversational pause,
+        and manual toggle-to-stop control.
+        """
         if silence_limit is None:
             silence_limit = self.silence_limit
         if start_timeout is None:
             start_timeout = self.follow_up_timeout
 
+        self.is_recording_active = True
+        self.manual_stop_recording.clear()
+        if hasattr(self, "dashboard") and self.dashboard:
+            self.dashboard.set_recording_state(True)
+
         frames = []
         silent_chunks = 0
         chunks_per_sec = RATE / CHUNK
-        max_silent_chunks = int(silence_limit * chunks_per_sec)
         max_total_chunks = int(max_duration * chunks_per_sec)
         timeout_chunks = int(start_timeout * chunks_per_sec)
         talking_started = False
+        talking_start_chunk = 0
 
-        # Flush stale mic buffer
-        while self.mic_stream.get_read_available() > 0:
-            self.mic_stream.read(self.mic_stream.get_read_available(), exception_on_overflow=False)
+        try:
+            # Flush stale mic buffer
+            while self.mic_stream.get_read_available() > 0:
+                self.mic_stream.read(self.mic_stream.get_read_available(), exception_on_overflow=False)
 
-        for i in range(max_total_chunks):
-            data = self.mic_stream.read(CHUNK, exception_on_overflow=False)
-            frames.append(data)
+            for i in range(max_total_chunks):
+                if self.manual_stop_recording.is_set():
+                    print("[Manual Stop] User stopped recording via button/hotkey.")
+                    break
 
-            audio_data = np.frombuffer(data, dtype=np.int16)
-            volume = np.abs(audio_data).mean()
+                data = self.mic_stream.read(CHUNK, exception_on_overflow=False)
+                frames.append(data)
 
-            # Stream live volume level to floating pill waveform
-            if self.pill:
-                norm = min(1.0, max(0.0, (volume - self.noise_floor) / max(600, self.speech_threshold - self.noise_floor + 200)))
-                self.pill.update_volume(norm)
+                audio_data = np.frombuffer(data, dtype=np.int16)
+                volume = np.abs(audio_data).mean()
 
-            if volume > self.speech_threshold:
-                if not talking_started:
-                    talking_started = True
-                    if self.pill:
-                        self.pill.set_state("recording")
-                silent_chunks = 0
-            elif talking_started:
-                silent_chunks += 1
+                # Stream live volume level to floating pill waveform
+                if self.pill:
+                    norm = min(1.0, max(0.0, (volume - self.noise_floor) / max(600, self.speech_threshold - self.noise_floor + 200)))
+                    self.pill.update_volume(norm)
 
-            if talking_started and silent_chunks > max_silent_chunks:
-                break
-            if not talking_started and i > timeout_chunks:
-                break
+                if volume > self.speech_threshold:
+                    if not talking_started:
+                        talking_started = True
+                        talking_start_chunk = i
+                        if self.pill:
+                            self.pill.set_state("recording")
+                    silent_chunks = 0
+                elif talking_started:
+                    silent_chunks += 1
 
-        if not talking_started or not frames:
-            return np.zeros(0, dtype=np.int16)
+                # Adaptive conversational pause: once speech has been going on for > 1.0s,
+                # extend the silence window slightly (e.g. 1.4s) to allow natural breathing/thought pauses
+                if talking_started:
+                    spoken_duration = (i - talking_start_chunk) * (CHUNK / RATE)
+                    effective_silence = max(silence_limit, 1.4) if spoken_duration > 1.0 else silence_limit
+                    if silent_chunks > int(effective_silence * chunks_per_sec):
+                        break
 
-        return np.concatenate([np.frombuffer(f, dtype=np.int16) for f in frames])
+                if not talking_started and i > timeout_chunks:
+                    break
+
+            if not talking_started or not frames:
+                return np.zeros(0, dtype=np.int16)
+
+            return np.concatenate([np.frombuffer(f, dtype=np.int16) for f in frames])
+        finally:
+            self.is_recording_active = False
+            self.manual_stop_recording.clear()
+            if hasattr(self, "dashboard") and self.dashboard:
+                self.dashboard.set_recording_state(False)
 
     def transcribe(self, audio_data: np.ndarray) -> str:
-        """Transcribe speech using Parakeet-EOU INT8, with Whisper fallback."""
+        """Transcribe speech using Parakeet-TDT (622MB) or Parakeet-EOU (120MB), with Whisper fallback."""
         if len(audio_data) < RATE * 0.4:
             return ""
 
-        # Parakeet-EOU INT8
+        # Parakeet-TDT or Parakeet-EOU
         if self.stt is not None:
             try:
                 t0 = time.time()
                 text = self.stt.transcribe(audio_data)
                 if text.strip():
-                    print(f"⚡ STT (Parakeet-EOU): \"{text.strip()}\" ({time.time()-t0:.2f}s)")
+                    model_name = self.stt.__class__.__name__
+                    print(f"⚡ STT ({model_name}): \"{text.strip()}\" ({time.time()-t0:.2f}s)")
                     return text.strip()
-            except Exception:
-                pass
+            except Exception as e:
+                print(f"[Notice] STT inference error: {e}")
 
         # Whisper fallback
         try:
@@ -962,8 +994,8 @@ class FastAgent:
             except Exception as e2:
                 return f"Sorry, network error: {e2}", []
 
-    def execute_command_pipeline(self, user_text: str, source: str = "voice"):
-        """Processes user command, calls LLM & tools, speaks reply, and updates dashboard."""
+    def execute_command_pipeline(self, user_text: str, source: str = "voice", t_stt: float = 0.0):
+        """Processes user command, calls LLM & tools, speaks reply, measures latency, and updates dashboard."""
         clean_text = user_text.lower().strip(" .,?!\"'")
         if clean_text in ("", "mmhm", "mhm", "uh", "um", "ah", "hm", "huh", "yeah", "ok", "okay") or clean_text in {"you", "the", "a", "i", "oh", "so", "thank you", "thanks for watching"}:
             if self.pill:
@@ -971,10 +1003,17 @@ class FastAgent:
             return
 
         if self.is_dismissal_command(clean_text):
-            self.dashboard.add_interaction(user_text, "Standing by.", source=source, tool="sleep")
             if self.pill:
                 self.pill.set_state("speaking")
-            self.tts_speak("Standing by.")
+            t_tts = self.tts_speak("Standing by.")
+            t_total = t_stt + t_tts
+            self.dashboard.add_interaction(
+                user_text=user_text,
+                response="Standing by.",
+                source=source,
+                tool="sleep",
+                latency={"total": round(t_total, 2), "stt": round(t_stt, 2), "llm": 0.0, "tool": 0.0, "tts": round(t_tts, 2)}
+            )
             if self.is_session_active:
                 self.is_session_active = False
             return
@@ -983,10 +1022,17 @@ class FastAgent:
             self.pill.set_state("processing")
 
         prompt = f"[Voice Input]: {user_text}" if source == "voice" else f"[Typed Input]: {user_text}"
+        
+        # 1. LLM Generation
+        t0_llm = time.time()
         content, tool_calls = self.query_llm(prompt)
+        t_llm = time.time() - t0_llm
 
+        # 2. Tool Execution
+        t0_tool = time.time()
         tool_results = []
         executed_tool_name = ""
+        memory_affected = False
         if tool_calls:
             for tc in tool_calls:
                 fn = tc.get("function", {})
@@ -1000,6 +1046,9 @@ class FastAgent:
                 res = dispatch_tool_call(name, args, agent_ref=self)
                 tool_results.append(res)
                 executed_tool_name = name
+                if name in ("save_memory", "forget_memory"):
+                    memory_affected = True
+        t_tool = time.time() - t0_tool
 
         spoken_response = content.strip()
         if not spoken_response and tool_results:
@@ -1012,26 +1061,46 @@ class FastAgent:
 
         self.history.append({"role": "assistant", "content": spoken_response})
 
+        if self.pill:
+            self.pill.set_state("speaking")
+
+        # 3. TTS Speech Synthesis
+        t_tts = self.tts_speak(cleaned_speech)
+
+        # 4. Latency Aggregation & Reporting
+        t_total = t_stt + t_llm + t_tool + t_tts
+        latency_info = {
+            "total": round(t_total, 2),
+            "stt": round(t_stt, 2),
+            "llm": round(t_llm, 2),
+            "tool": round(t_tool, 2),
+            "tts": round(t_tts, 2)
+        }
+        print(f"⏱️ [Latency Benchmark] Total: {t_total:.2f}s | STT: {t_stt:.2f}s | LLM: {t_llm:.2f}s | Tool: {t_tool:.2f}s | TTS Gen: {t_tts:.2f}s")
+
         # Add interaction to Dashboard GUI feed
         self.dashboard.add_interaction(
             user_text=user_text,
             response=spoken_response,
             source=source,
-            tool=executed_tool_name
+            tool=executed_tool_name,
+            latency=latency_info
         )
 
-        if self.pill:
-            self.pill.set_state("speaking")
+        if memory_affected:
+            self.dashboard.refresh_memory_view()
 
-        self.tts_speak(cleaned_speech)
-
-    def tts_speak(self, text: str):
-        """Neural Edge-TTS speech with instant offline SAPI fallback."""
+    def tts_speak(self, text: str) -> float:
+        """Neural Edge-TTS speech with instant offline SAPI fallback.
+        Returns audio synthesis time in seconds.
+        """
         clean_text = clean_spoken_text(text)
         if not clean_text:
-            return
+            return 0.0
 
         self.is_speaking.set()
+        t0_gen = time.time()
+        tts_gen_time = 0.0
 
         temp_audio = os.path.join(
             os.path.expanduser("~"),
@@ -1046,6 +1115,7 @@ class FastAgent:
 
         try:
             asyncio.run(generate_speech())
+            tts_gen_time = time.time() - t0_gen
             if os.path.exists(temp_audio):
                 pygame.mixer.music.load(temp_audio)
                 pygame.mixer.music.play()
@@ -1058,6 +1128,7 @@ class FastAgent:
                     pass
         except Exception:
             # SAPI fallback
+            tts_gen_time = time.time() - t0_gen
             try:
                 if self.sapi_engine:
                     self.sapi_engine.say(clean_text)
@@ -1208,7 +1279,9 @@ class FastAgent:
             if self.pill:
                 self.pill.set_state("processing")
 
+            t0_stt = time.time()
             user_text = self.transcribe(audio_data)
+            t_stt = time.time() - t0_stt
             clean_text = user_text.lower().strip(" .,?!\"'")
 
             if not clean_text or clean_text in ambient_hallucinations or clean_text in ("", "mmhm", "mhm", "uh", "um", "ah", "hm", "huh"):
@@ -1218,14 +1291,21 @@ class FastAgent:
             # Voice dismissal / sleep check
             if self.is_dismissal_command(clean_text):
                 print(f"[Voice Dismissal: '{user_text}'] -> Entering standby sleep")
-                self.dashboard.add_interaction(user_text, "Standing by.", source="voice", tool="sleep")
                 if self.pill:
                     self.pill.set_state("speaking")
-                self.tts_speak("Standing by.")
+                t_tts = self.tts_speak("Standing by.")
+                t_total = t_stt + t_tts
+                self.dashboard.add_interaction(
+                    user_text=user_text,
+                    response="Standing by.",
+                    source="voice",
+                    tool="sleep",
+                    latency={"total": round(t_total, 2), "stt": round(t_stt, 2), "llm": 0.0, "tool": 0.0, "tts": round(t_tts, 2)}
+                )
                 break
 
             # Execute normal command
-            self.execute_command_pipeline(user_text, source="voice")
+            self.execute_command_pipeline(user_text, source="voice", t_stt=t_stt)
 
             # After response, keep session open for follow_up_timeout (default 10s)
             current_timeout = self.follow_up_timeout
