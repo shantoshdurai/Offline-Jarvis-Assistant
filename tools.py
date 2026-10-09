@@ -1,3 +1,6 @@
+import time
+import threading
+import ctypes
 import os
 import sys
 import subprocess
@@ -33,6 +36,104 @@ def get_chrome_exe():
             return p
     return None
 
+def _trigger_playback_after_delay():
+    time.sleep(2.0)
+    try:
+        user32 = ctypes.windll.user32
+        KEYEVENTF_KEYUP = 0x0002
+        user32.keybd_event(ord('K'), 0, 0, 0)
+        user32.keybd_event(ord('K'), 0, KEYEVENTF_KEYUP, 0)
+        user32.keybd_event(0xB3, 0, 0, 0)
+        user32.keybd_event(0xB3, 0, KEYEVENTF_KEYUP, 0)
+    except Exception:
+        pass
+
+def _schedule_autoplay_trigger():
+    threading.Thread(target=_trigger_playback_after_delay, daemon=True).start()
+
+def browser_control(action: str, tab_index: int = None, url: str = None) -> str:
+    """Controls browser tabs, URL navigation, and media playback across Firefox, Chrome, and Edge."""
+    action = (action or "").lower().strip()
+
+    user32 = ctypes.windll.user32
+    KEYEVENTF_KEYUP = 0x0002
+    VK_CONTROL = 0x11
+    VK_SHIFT = 0x10
+    VK_TAB = 0x09
+    VK_ESCAPE = 0x1B
+    VK_F5 = 0x74
+
+    def send_combo(*vks):
+        for vk in vks:
+            user32.keybd_event(vk, 0, 0, 0)
+        for vk in reversed(vks):
+            user32.keybd_event(vk, 0, KEYEVENTF_KEYUP, 0)
+
+    if action in ("play_pause", "play", "pause", "resume", "toggle_play"):
+        user32.keybd_event(ord('K'), 0, 0, 0)
+        user32.keybd_event(ord('K'), 0, KEYEVENTF_KEYUP, 0)
+        user32.keybd_event(0xB3, 0, 0, 0)
+        user32.keybd_event(0xB3, 0, KEYEVENTF_KEYUP, 0)
+        return "Playback started." if action in ("play", "resume") else "Playback toggled."
+
+    elif action in ("next_tab", "switch_next_tab"):
+        send_combo(VK_CONTROL, VK_TAB)
+        return "Switched to next tab."
+
+    elif action in ("previous_tab", "prev_tab", "switch_prev_tab"):
+        send_combo(VK_CONTROL, VK_SHIFT, VK_TAB)
+        return "Switched to previous tab."
+
+    elif action in ("switch_tab", "go_to_tab"):
+        idx = int(tab_index or 1)
+        if idx < 1: idx = 1
+        if idx > 9: idx = 9
+        vk_num = 0x30 + idx
+        send_combo(VK_CONTROL, vk_num)
+        return f"Switched to tab {idx}."
+
+    elif action in ("close_tab", "close_current_tab"):
+        send_combo(VK_CONTROL, ord('W'))
+        return "Closed active tab."
+
+    elif action in ("reopen_tab", "undo_close_tab"):
+        send_combo(VK_CONTROL, VK_SHIFT, ord('T'))
+        return "Reopened closed tab."
+
+    elif action in ("new_tab", "open_new_tab"):
+        if url:
+            open_url(url)
+            return f"Opened {url} in new tab."
+        send_combo(VK_CONTROL, ord('T'))
+        return "Opened new tab."
+
+    elif action in ("reload_tab", "refresh_tab", "refresh"):
+        send_combo(VK_F5)
+        return "Refreshed active tab."
+
+    elif action in ("get_url", "read_url", "current_url"):
+        send_combo(VK_CONTROL, ord('L'))
+        time.sleep(0.08)
+        send_combo(VK_CONTROL, ord('C'))
+        time.sleep(0.08)
+        send_combo(VK_ESCAPE)
+
+        read_url = ""
+        try:
+            import win32clipboard, win32con
+            win32clipboard.OpenClipboard()
+            if win32clipboard.IsClipboardFormatAvailable(win32con.CF_UNICODETEXT):
+                read_url = win32clipboard.GetClipboardData(win32con.CF_UNICODETEXT)
+            win32clipboard.CloseClipboard()
+        except Exception:
+            pass
+
+        if read_url and ("http://" in read_url or "https://" in read_url or "." in read_url):
+            return f"Active tab URL is {read_url.strip()}."
+        return "Could not read active tab URL."
+
+    return f"Unknown browser action: '{action}'."
+
 def play_video(query_or_target, browser=None):
     """Search for the top video on YouTube and immediately open and play it directly."""
     cleaned_query = query_or_target.strip().strip("'\"")
@@ -51,7 +152,7 @@ def play_video(query_or_target, browser=None):
             html = resp.read().decode("utf-8", errors="ignore")
         vids = re.findall(r'/watch\?v=([a-zA-Z0-9_-]{11})', html)
         if vids:
-            target_url = f"https://www.youtube.com/watch?v={vids[0]}"
+            target_url = f"https://www.youtube.com/watch?v={vids[0]}&autoplay=1"
     except Exception:
         pass
 
@@ -60,15 +161,19 @@ def play_video(query_or_target, browser=None):
         ff = get_firefox_exe()
         if ff:
             subprocess.Popen([ff, target_url])
+            _schedule_autoplay_trigger()
             return f"Playing '{cleaned_query}' on YouTube in Firefox."
     elif "chrome" in browser_lower:
         ch = get_chrome_exe()
         if ch:
             subprocess.Popen([ch, target_url])
+            _schedule_autoplay_trigger()
             return f"Playing '{cleaned_query}' on YouTube in Chrome."
 
     webbrowser.open(target_url)
+    _schedule_autoplay_trigger()
     return f"Playing '{cleaned_query}' on YouTube."
+
 
 def get_friendly_site_name(url: str, raw_target: str) -> str:
     """Extracts a clean, voice-friendly description of what was opened."""
@@ -719,6 +824,111 @@ def move_item(source_path, dest_path):
     except Exception as e:
         return f"Failed to move item: {e}"
 
+def resolve_folder_path(folder_name=""):
+    """Resolves friendly folder names like 'downloads', 'desktop' or absolute paths."""
+    raw = (folder_name or "").strip().strip("'\"").lower()
+    user_home = os.path.expanduser("~")
+    if "download" in raw or not raw:
+        return os.path.join(user_home, "Downloads"), "Downloads"
+    elif "desktop" in raw:
+        return os.path.join(user_home, "Desktop"), "Desktop"
+    elif "document" in raw:
+        return os.path.join(user_home, "Documents"), "Documents"
+    elif "picture" in raw or "photo" in raw:
+        return os.path.join(user_home, "Pictures"), "Pictures"
+    elif "music" in raw:
+        return os.path.join(user_home, "Music"), "Music"
+    elif "video" in raw:
+        return os.path.join(user_home, "Videos"), "Videos"
+    elif "project" in raw or "code" in raw or "repo" in raw:
+        return os.getcwd(), "Current Project"
+    elif folder_name and os.path.exists(os.path.expanduser(folder_name.strip("'\""))):
+        p = os.path.expanduser(folder_name.strip("'\""))
+        return p, os.path.basename(p) or p
+    else:
+        return os.path.join(user_home, "Downloads"), "Downloads"
+
+def create_folder(folder_path=""):
+    """Creates a new folder or directory."""
+    raw = (folder_path or "").strip().strip("'\"")
+    if not raw:
+        return "Please specify a folder name or path to create."
+    p = os.path.expanduser(raw)
+    if not os.path.isabs(p):
+        p = os.path.join(os.path.expanduser("~"), "Downloads", raw)
+    try:
+        os.makedirs(p, exist_ok=True)
+        return f"Created folder '{os.path.basename(p)}' at {p}."
+    except Exception as e:
+        return f"Failed to create folder: {e}"
+
+def organize_folder(folder_name="downloads"):
+    """Automatically sorts and arranges loose files in a folder into categorized subfolders."""
+    target_dir, display_name = resolve_folder_path(folder_name)
+    if not os.path.exists(target_dir):
+        return f"Directory does not exist: {target_dir}"
+
+    categories = {
+        "Images": {'.png', '.jpg', '.jpeg', '.gif', '.bmp', '.svg', '.webp', '.ico', '.tiff', '.raw'},
+        "Videos": {'.mp4', '.mkv', '.avi', '.mov', '.wmv', '.flv', '.webm', '.m4v', '.mpg', '.mpeg'},
+        "Audio": {'.mp3', '.wav', '.flac', '.aac', '.ogg', '.m4a', '.wma', '.opus'},
+        "Documents": {'.pdf', '.docx', '.doc', '.xlsx', '.xls', '.pptx', '.ppt', '.txt', '.csv', '.rtf', '.epub', '.md'},
+        "Archives": {'.zip', '.rar', '.7z', '.tar', '.gz', '.bz2', '.iso', '.torrent'},
+        "Installers": {'.exe', '.msi', '.dmg', '.apk', '.bat', '.cmd'},
+        "3D & Creative": {'.blend', '.fbx', '.obj', '.stl', '.dae', '.psd', '.ai', '.kra', '.blend1'},
+        "Code": {'.py', '.json', '.xml', '.yaml', '.yml', '.html', '.css', '.js', '.ts', '.cpp', '.c', '.h', '.java', '.sql', '.rs', '.go'},
+    }
+
+    ext_to_cat = {}
+    for cat, exts in categories.items():
+        for ext in exts:
+            ext_to_cat[ext.lower()] = cat
+
+    try:
+        loose_files = []
+        for item in os.listdir(target_dir):
+            if item.startswith(".") or item.startswith("$") or item.lower() in ("desktop.ini", "thumbs.db"):
+                continue
+            full_item_path = os.path.join(target_dir, item)
+            if os.path.isfile(full_item_path):
+                loose_files.append(item)
+    except Exception as e:
+        return f"Error reading folder {target_dir}: {e}"
+
+    if not loose_files:
+        return f"No loose files found to organize in {display_name}. Everything is already organized into folders."
+
+    moved_counts = {}
+    for filename in loose_files:
+        _, ext = os.path.splitext(filename)
+        ext_lower = ext.lower()
+        cat = ext_to_cat.get(ext_lower, "Other")
+
+        cat_dir = os.path.join(target_dir, cat)
+        try:
+            os.makedirs(cat_dir, exist_ok=True)
+            src_path = os.path.join(target_dir, filename)
+            dest_path = os.path.join(cat_dir, filename)
+
+            if os.path.exists(dest_path):
+                base_name, file_ext = os.path.splitext(filename)
+                counter = 1
+                while os.path.exists(os.path.join(cat_dir, f"{base_name}_{counter}{file_ext}")):
+                    counter += 1
+                dest_path = os.path.join(cat_dir, f"{base_name}_{counter}{file_ext}")
+
+            shutil.move(src_path, dest_path)
+            moved_counts[cat] = moved_counts.get(cat, 0) + 1
+        except Exception as e:
+            print(f"[Warning] Failed moving {filename}: {e}")
+
+    total_moved = sum(moved_counts.values())
+    if total_moved == 0:
+        return f"No files were moved in {display_name}."
+
+    breakdown = ", ".join([f"{cnt} {cat}" for cat, cnt in sorted(moved_counts.items(), key=lambda x: -x[1])])
+    return f"Organized {total_moved} files in {display_name} into folders: {breakdown}."
+
 def execute_command(command):
     """Runs a shell CLI command and returns output."""
     cmd = command.strip().strip("'\"")
@@ -856,6 +1066,7 @@ AVAILABLE_TOOLS = {
     "play_youtube": play_video,
     "open_leetcode": open_leetcode,
     "open_app": open_app,
+    "close_app": close_app,
     "take_screenshot": take_screenshot,
     "inspect_screen": inspect_screen,
     "see_screen": inspect_screen,
@@ -864,6 +1075,8 @@ AVAILABLE_TOOLS = {
     "adjust_volume": adjust_volume,
     "get_installed_games": get_installed_games,
     "open_folder": open_folder,
+    "create_folder": create_folder,
+    "organize_folder": organize_folder,
     "list_folder": list_folder_contents,
     "list_folder_contents": list_folder_contents,
     "search_files": search_local_files,
@@ -871,7 +1084,8 @@ AVAILABLE_TOOLS = {
     "read_file": read_file_content,
     "read_file_content": read_file_content,
     "move_item": move_item,
-    "run_command": execute_command
+    "run_command": execute_command,
+    "browser_control": browser_control
 }
 
 def parse_and_execute_tool(text):
@@ -979,6 +1193,31 @@ def detect_and_run_intent(text):
             res = adjust_volume("mute")
             return True, f"[Action: {res}]", "Toggled volume mute for you.", False
 
+    # 4b. Browser Tab & Playback Control ("play it", "it is not playing", "resume", "pause", "next tab", "previous tab", "close tab", "what is the url")
+    if any(p in t for p in ["it is not playing", "it's not playing", "not playing", "play the song", "play it", "resume the video", "pause the video", "pause the song", "resume playback", "toggle play"]):
+        res = browser_control("play_pause")
+        return True, f"[Action: {res}]", res, False
+
+    if any(p in t for p in ["next tab", "switch to next tab", "go to next tab"]):
+        res = browser_control("next_tab")
+        return True, f"[Action: {res}]", res, False
+
+    if any(p in t for p in ["previous tab", "prev tab", "switch to previous tab", "go to previous tab"]):
+        res = browser_control("previous_tab")
+        return True, f"[Action: {res}]", res, False
+
+    if any(p in t for p in ["close this tab", "close the tab", "close active tab", "close tab"]):
+        res = browser_control("close_tab")
+        return True, f"[Action: {res}]", res, False
+
+    if any(p in t for p in ["reopen tab", "undo close tab", "reopen closed tab"]):
+        res = browser_control("reopen_tab")
+        return True, f"[Action: {res}]", res, False
+
+    if any(p in t for p in ["what is the url", "what's the url", "get url", "current url", "copy url", "read url"]):
+        res = browser_control("get_url")
+        return True, f"[Action: {res}]", res, False
+
     # 5. YouTube Intent (clean extraction, direct playback vs search, frank fallback)
     is_play_music = t.startswith("play ") and any(w in t for w in ["music", "song", "theme", "track", "audio", "video", "ost", "lofi", "beats", "remix"])
     if ("youtube" in t and any(w in t for w in ["open", "play", "launch", "start", "show", "watch", "want", "search"])) or is_play_music:
@@ -1038,6 +1277,26 @@ def detect_and_run_intent(text):
         res = list_folder_contents(target, max_items=12)
         preview_speech = f"Here are the files in your {target.strip().capitalize()} folder. I have displayed them on your screen."
         return True, f"[Action: Listed folder contents]\n{res}", preview_speech, False
+
+    # 8b. Folder Organization Intent ("organize downloads", "arrange files in download folder", "sort files into folders")
+    if any(w in t for w in ["organize", "arrange files", "sort files", "arrange them", "clean up downloads", "clean up folder"]) and any(f in t for f in ["download", "desktop", "document", "picture", "file", "folder", "them"]):
+        target = "downloads"
+        if "desktop" in t:
+            target = "desktop"
+        elif "document" in t:
+            target = "documents"
+        elif "picture" in t:
+            target = "pictures"
+        res = organize_folder(target)
+        return True, f"[Action: {res}]", res, False
+
+    # 8c. Create Folder Intent ("create folder work", "make a folder named projects")
+    if any(p in t for p in ["create folder", "make a folder", "make folder", "create a folder"]):
+        m = re.search(r'(?:create\s+(?:a\s+)?folder|make\s+(?:a\s+)?folder)(?:\s+named|\s+called)?\s+([a-zA-Z0-9_\-\\/\s]+)', t)
+        if m:
+            f_name = m.group(1).strip()
+            res = create_folder(f_name)
+            return True, f"[Action: {res}]", res, False
 
     # 9. Search Local Files ("search for file requirements.txt", "find file ...", "where is file ...")
     if any(t.startswith(prefix) for prefix in ["search for file ", "search file ", "find file ", "where is file ", "look for file ", "find the file "]):

@@ -119,9 +119,14 @@ VOICE & TTS GUIDELINES:
 - When asked to shut down the PC or computer, call system_control(action='shutdown_pc').
 - When told to remember facts or notes (e.g. preferences, project details), call save_memory. When asked what you remember, call recall_memory.
 - When asked to play music or videos, call play_video.
+- If audio or video is already open in the browser and the user says 'play it', 'it is not playing', 'resume', or 'pause', call browser_control(action='play_pause'). NEVER call play_video again if a tab is already open.
+- When asked to switch tabs, go to next/previous tab, close tab, reopen closed tab, reload tab, or inspect/read the active tab's URL, call browser_control.
+- When asked to organize, sort, arrange, or clean up files in a folder (such as Downloads or Desktop), ALWAYS call organize_folder. Never just list files and stop!
+- When asked to create a folder or directory, call create_folder.
 - When asked to open apps, websites, or folders, call the appropriate tool.
 - When asked what apps or software are installed on the PC, call list_installed_apps.
 - When asked to run terminal commands, inspect files, or read code, use run_command, search_files, read_file, or list_folder_contents.
+- When reporting folder contents, summarize the count and top 3-5 items briefly in 1 conversational sentence. NEVER read long lists of filenames aloud.
 - Never read out code blocks, raw markdown, or long technical logs aloud.
 CLARIFICATION & CONFIRMATION:
 - If a user's voice command is ambiguous, incomplete, or you suspect STT misheard words, ask a concise 1-sentence question to confirm what they meant before taking action.
@@ -148,6 +153,31 @@ TOOL_DEFINITIONS = [
                     }
                 },
                 "required": ["query"]
+            }
+        }
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "browser_control",
+            "description": "Controls browser tabs, URL navigation, and media playback across Firefox, Chrome, and Edge.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "action": {
+                        "type": "string",
+                        "description": "Action: 'play_pause', 'next_tab', 'previous_tab', 'switch_tab', 'close_tab', 'reopen_tab', 'reload_tab', 'new_tab', 'get_url'."
+                    },
+                    "tab_index": {
+                        "type": "integer",
+                        "description": "Tab number (1-9) when action is 'switch_tab'."
+                    },
+                    "url": {
+                        "type": "string",
+                        "description": "Optional URL when action is 'new_tab'."
+                    }
+                },
+                "required": ["action"]
             }
         }
     },
@@ -238,6 +268,40 @@ TOOL_DEFINITIONS = [
                     }
                 },
                 "required": ["folder_path"]
+            }
+        }
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "create_folder",
+            "description": "Create a new folder / directory on the PC.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "folder_path": {
+                        "type": "string",
+                        "description": "Name or path of the new folder to create."
+                    }
+                },
+                "required": ["folder_path"]
+            }
+        }
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "organize_folder",
+            "description": "Automatically sorts and arranges loose files in a folder (e.g. Downloads, Desktop) into categorized subfolders (Images, Videos, Audio, Documents, Archives, Installers, 3D & Creative, Code).",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "folder_name": {
+                        "type": "string",
+                        "description": "Folder to organize: 'downloads', 'desktop', 'documents', or a folder path.",
+                        "default": "downloads"
+                    }
+                }
             }
         }
     },
@@ -424,6 +488,8 @@ def dispatch_tool_call(name: str, args: Dict[str, Any], agent_ref: Optional[Any]
     try:
         if name == "play_video":
             return tools.play_video(args.get("query", ""), args.get("browser"))
+        elif name == "browser_control":
+            return tools.browser_control(args.get("action", ""), tab_index=args.get("tab_index"), url=args.get("url"))
         elif name == "open_app":
             return tools.open_app(args.get("app_name", ""))
         elif name == "close_app":
@@ -435,6 +501,10 @@ def dispatch_tool_call(name: str, args: Dict[str, Any], agent_ref: Optional[Any]
             return action
         elif name == "open_folder":
             return tools.open_folder(args.get("folder_path", ""))
+        elif name == "create_folder":
+            return tools.create_folder(args.get("folder_path", ""))
+        elif name == "organize_folder":
+            return tools.organize_folder(args.get("folder_name", "downloads"))
         elif name == "take_screenshot":
             return tools.take_screenshot()
         elif name == "system_control":
@@ -516,6 +586,16 @@ def clean_spoken_text(text: str) -> str:
     if not text:
         return ""
     s = text.strip()
+
+    # 0. Summarize multi-item folder listings so TTS does not read hundreds of filenames aloud
+    if s.startswith("Contents of ") or "items total):" in s:
+        m = re.search(r'Contents of ([^(]+)\((\d+)\s+items', s)
+        if m:
+            folder = m.group(1).strip()
+            count = m.group(2).strip()
+            return f"I found {count} items in your {folder} folder. I have displayed them on your screen."
+        return "I have listed the folder contents on your screen."
+
     # 1. Clean markdown code blocks, backticks, bold, headers, list bullets
     s = re.sub(r'```[\s\S]*?```', '', s)
     s = re.sub(r'`([^`]+)`', r'\1', s)

@@ -87,6 +87,7 @@ def test_voice_tts_sanitizer(clean_spoken_fn):
         ("Check https://reddit.com/r/python for docs.", "Check Reddit for docs."),
         ("```python\nprint('hello')\n``` Done!", "Done!"),
         ("File saved at C:\\Users\\Dog\\Downloads\\report.pdf", "File saved at report.pdf"),
+        ("Contents of Downloads (344 items total):\n  [DIR] Subdir\n  file1.mp4 (45 MB)\n  ... and 342 more items", "I found 344 items in your Downloads folder. I have displayed them on your screen."),
     ]
 
     for raw, expected in test_cases:
@@ -201,6 +202,50 @@ def test_tool_dispatch():
     res_ambiguous = tools.open_app("studio")
     print("  Ambiguous App Confirmation:", res_ambiguous)
     assert "which one would you like" in res_ambiguous.lower()
+
+    # 10. Browser control tab and playback actions
+    res_bc_play = tools.browser_control("play_pause")
+    print("  Browser Control (play_pause):", res_bc_play)
+    assert "Playback" in res_bc_play
+
+    res_bc_tab = tools.browser_control("next_tab")
+    print("  Browser Control (next_tab):", res_bc_tab)
+    assert "Switched to next tab" in res_bc_tab
+
+    res_bc_unknown = tools.browser_control("unknown_action_xyz")
+    assert "Unknown browser action" in res_bc_unknown
+
+    # 11. Folder creation and automated file organization
+    import tempfile, shutil
+    test_dir = tempfile.mkdtemp(prefix="jarvis_test_organize_")
+    try:
+        dummy_files = [
+            "photo.jpg", "screenshot.png", "clip.mp4", "song.wav",
+            "notes.txt", "data.csv", "backup.zip", "setup.exe",
+            "character.blend", "agent.py"
+        ]
+        for f in dummy_files:
+            with open(os.path.join(test_dir, f), "w") as fp:
+                fp.write("test content")
+
+        res_org = tools.organize_folder(test_dir)
+        print("  Organize Folder Result:", res_org)
+        assert "Organized 10 files" in res_org
+
+        assert os.path.exists(os.path.join(test_dir, "Images", "photo.jpg"))
+        assert os.path.exists(os.path.join(test_dir, "Videos", "clip.mp4"))
+        assert os.path.exists(os.path.join(test_dir, "Audio", "song.wav"))
+        assert os.path.exists(os.path.join(test_dir, "Documents", "notes.txt"))
+        assert os.path.exists(os.path.join(test_dir, "Archives", "backup.zip"))
+        assert os.path.exists(os.path.join(test_dir, "Installers", "setup.exe"))
+        assert os.path.exists(os.path.join(test_dir, "3D & Creative", "character.blend"))
+        assert os.path.exists(os.path.join(test_dir, "Code", "agent.py"))
+
+        res_org2 = tools.organize_folder(test_dir)
+        print("  Organize Folder (clean state):", res_org2)
+        assert "already organized" in res_org2
+    finally:
+        shutil.rmtree(test_dir, ignore_errors=True)
 
     print("Tool Execution Suite: 100% Passed.")
 
