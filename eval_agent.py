@@ -174,6 +174,21 @@ def test_tool_dispatch():
     print("  Open App (missing fallback):", res_missing)
     assert "couldn't find" in res_missing.lower()
 
+    # 7. List installed apps
+    res_apps = tools.list_installed_apps()
+    print("  List Installed Apps:", res_apps[:80] + "...")
+    assert "Found" in res_apps and "installed applications" in res_apps
+
+    # 8. Clarification question on misheard app name (e.g. 'gravity' -> Antigravity)
+    res_misheard = tools.open_app("gravity")
+    print("  Misheard App Confirmation:", res_misheard)
+    assert "did you mean" in res_misheard.lower()
+
+    # 9. Confirmation question on ambiguous app name (e.g. 'studio' -> multiple options)
+    res_ambiguous = tools.open_app("studio")
+    print("  Ambiguous App Confirmation:", res_ambiguous)
+    assert "which one would you like" in res_ambiguous.lower()
+
     print("Tool Execution Suite: 100% Passed.")
 
 

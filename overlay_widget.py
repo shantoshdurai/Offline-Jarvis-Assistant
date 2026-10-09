@@ -101,7 +101,14 @@ class FloatingVoicePill:
         self.target_level = max(0.0, min(1.0, vol))
 
     def stop(self):
-        """Cleanly destroy overlay widget."""
+        """Cleanly destroy overlay widget immediately."""
+        self.is_running = False
+        try:
+            if hasattr(self, "root") and self.root:
+                self.root.withdraw()
+                self.root.destroy()
+        except Exception:
+            pass
         self.queue.put(("destroy", None))
 
     def _init_ui(self, parent_widget):
@@ -187,6 +194,14 @@ class FloatingVoicePill:
         self.canvas.create_line(cx + 4, cy - 4, cx + 4, cy + 4, fill="#ffffff", width=1.5)
 
     def _animate(self):
+        if not self.is_running:
+            try:
+                self.root.withdraw()
+                self.root.destroy()
+            except Exception:
+                pass
+            return
+
         # Process any pending events
         while not self.queue.empty():
             msg, val = self.queue.get_nowait()

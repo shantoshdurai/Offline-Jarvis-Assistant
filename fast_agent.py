@@ -118,8 +118,12 @@ VOICE & TTS GUIDELINES:
 - When told to remember facts or notes (e.g. preferences, project details), call save_memory. When asked what you remember, call recall_memory.
 - When asked to play music or videos, call play_video.
 - When asked to open apps, websites, or folders, call the appropriate tool.
+- When asked what apps or software are installed on the PC, call list_installed_apps.
 - When asked to run terminal commands, inspect files, or read code, use run_command, search_files, read_file, or list_folder_contents.
 - Never read out code blocks, raw markdown, or long technical logs aloud.
+CLARIFICATION & CONFIRMATION:
+- If a user's voice command is ambiguous, incomplete, or you suspect STT misheard words, ask a concise 1-sentence question to confirm what they meant before taking action.
+- If an app name could refer to multiple installed apps, confirm with the user which one they prefer.
 """
 
 TOOL_DEFINITIONS = [
@@ -385,6 +389,23 @@ TOOL_DEFINITIONS = [
     {
         "type": "function",
         "function": {
+            "name": "list_installed_apps",
+            "description": "List software and installed applications discovered on the user's PC (e.g. Antigravity, Blender, Claude, VS Code, Discord, OBS, Unity, Steam).",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "filter_query": {
+                        "type": "string",
+                        "description": "Optional keyword or category to filter apps by.",
+                        "default": ""
+                    }
+                }
+            }
+        }
+    },
+    {
+        "type": "function",
+        "function": {
             "name": "exit_jarvis",
             "description": "Completely stop and shut down the Jarvis assistant application when the user asks to 'shut down jarvis', 'exit jarvis', 'quit jarvis', or 'stop jarvis'.",
             "parameters": {
@@ -436,6 +457,8 @@ def dispatch_tool_call(name: str, args: Dict[str, Any], agent_ref: Optional[Any]
             return tools.read_file_content(args.get("file_path", ""))
         elif name == "list_folder_contents":
             return tools.list_folder_contents(args.get("folder_name", "downloads"))
+        elif name == "list_installed_apps":
+            return tools.list_installed_apps(args.get("filter_query", ""))
         elif name == "save_memory":
             import memory_manager
             return memory_manager.remember_fact_or_note(args.get("fact_or_note", ""))
@@ -1262,13 +1285,53 @@ class FastAgent:
                 break
 
     def shutdown(self):
-        """Gracefully terminate Jarvis agent and release hardware resources."""
+        """Gracefully terminate Jarvis agent, destroy all UI widgets, and exit process."""
         self.is_running = False
+
+        # 1. Immediately hide and destroy the floating voice pill
         try:
-            if hasattr(self, "dashboard") and self.dashboard and self.dashboard.root:
-                self.dashboard.root.after(0, self.dashboard.root.quit)
+            if hasattr(self, "pill") and self.pill:
+                self.pill.stop()
         except Exception:
             pass
+
+        # 2. Stop tray icon
+        try:
+            if hasattr(self, "tray_icon") and self.tray_icon:
+                self.tray_icon.stop()
+        except Exception:
+            pass
+
+        # 3. Schedule UI destruction on main thread
+        try:
+            if hasattr(self, "dashboard") and self.dashboard and self.dashboard.root:
+                self.dashboard.root.after(0, self._destroy_ui_and_exit)
+        except Exception:
+            pass
+
+        # 4. Fallback exit watchdog (0.35s) to guarantee zero orphaned background threads
+        def force_watchdog():
+            time.sleep(0.35)
+            self._cleanup_resources()
+            os._exit(0)
+        threading.Thread(target=force_watchdog, daemon=True).start()
+
+    def _destroy_ui_and_exit(self):
+        """Main UI thread handler to cleanly close all Win32 windows."""
+        try:
+            if hasattr(self, "pill") and self.pill:
+                self.pill.stop()
+        except Exception:
+            pass
+        try:
+            if hasattr(self, "dashboard") and self.dashboard and self.dashboard.root:
+                self.dashboard.root.withdraw()
+                self.dashboard.root.destroy()
+                self.dashboard.root.quit()
+        except Exception:
+            pass
+        self._cleanup_resources()
+        os._exit(0)
 
     def _cleanup_resources(self):
         """Release audio hardware and tray icon."""

@@ -927,10 +927,17 @@ class JarvisDashboard:
             threading.Thread(target=self.on_trigger_voice, daemon=True).start()
 
     def _handle_stop_click(self):
+        try:
+            self.root.withdraw()
+        except Exception:
+            pass
         if self.on_stop_jarvis:
             self.on_stop_jarvis()
         else:
-            self.root.destroy()
+            try:
+                self.root.destroy()
+            except Exception:
+                pass
             os._exit(0)
 
     # ==========================================
