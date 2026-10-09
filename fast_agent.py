@@ -942,9 +942,18 @@ class FastAgent:
     def execute_command_pipeline(self, user_text: str, source: str = "voice"):
         """Processes user command, calls LLM & tools, speaks reply, and updates dashboard."""
         clean_text = user_text.lower().strip(" .,?!\"'")
-        if clean_text in ("", "mmhm", "mhm", "uh", "um", "ah", "hm", "huh", "yeah", "ok", "okay"):
+        if clean_text in ("", "mmhm", "mhm", "uh", "um", "ah", "hm", "huh", "yeah", "ok", "okay") or clean_text in {"you", "the", "a", "i", "oh", "so", "thank you", "thanks for watching"}:
             if self.pill:
                 self.pill.set_state("idle")
+            return
+
+        if self.is_dismissal_command(clean_text):
+            self.dashboard.add_interaction(user_text, "Standing by.", source=source, tool="sleep")
+            if self.pill:
+                self.pill.set_state("speaking")
+            self.tts_speak("Standing by.")
+            if self.is_session_active:
+                self.is_session_active = False
             return
 
         if self.pill:
@@ -1089,10 +1098,20 @@ class FastAgent:
             return True
 
         # Direct shutdown / turn off requests directed at Jarvis
-        if "shut down" in clean or "turn off" in clean:
+        if "shut down" in clean or "turn off" in clean or clean in ("off", "off jarvis", "shut off", "power off"):
             return True
 
         exact_phrases = {
+            # Silence and dismissals
+            "nothing", "say nothing", "no nothing", "it's nothing", "its nothing",
+            "nothing for now", "nothing else", "no nothing else", "nothing jarvis",
+            "say nothing jarvis", "nothing thank you", "nothing thanks",
+            "off", "off jarvis", "turn off", "shut off", "power off",
+            "never mind", "nevermind", "never mind jarvis", "nevermind jarvis",
+            "stop", "stop jarvis", "stop it", "stop talking", "stop speaking",
+            "quiet", "be quiet", "quiet now", "quiet jarvis", "shh", "shush", "shut up",
+            "cancel", "abort",
+            # Standard farewells
             "that's all", "thats all", "that is all",
             "that's all bye", "thats all bye", "that is all bye",
             "that's all for now", "thats all for now", "that is all for now",
@@ -1106,6 +1125,11 @@ class FastAgent:
             return True
 
         patterns = [
+            r'^(?:no\s+|ok\s+|okay\s+)?(?:say\s+)?nothing(?:\s+else)?(?:\s+for\s+now)?(?:\s+jarvis)?(?:\s+thanks|\s+thank\s+you)?$',
+            r'^(?:never\s*mind|nevermind)(?:\s+jarvis)?$',
+            r'^(?:be\s+)?quiet(?:\s+now)?(?:\s+jarvis)?$',
+            r'^(?:off|power\s+off|shut\s+off)(?:\s+jarvis)?$',
+            r'^(?:stop\s+talking|stop\s+speaking|stop)(?:\s+jarvis)?$',
             r'^(?:ok\s+|okay\s+|no\s+)?(?:thanks\s+|thank\s+you\s+)?(?:that\'s\s+all|thats\s+all|that\s+is\s+all)(?:\s+bye)?(?:\s+jarvis)?(?:\s+for\s+now)?$',
             r'^(?:ok\s+|okay\s+|no\s+)?(?:thanks\s+|thank\s+you\s+)?(?:bye|goodbye|bye\s+bye)(?:\s+jarvis)?(?:\s+for\s+now)?$',
             r'^(?:and\s+then\s+|i\s+want\s+you\s+to\s+|please\s+)?(?:go\s+to\s+sleep|sleep|shut\s+down|terminate\s+yourself|dismiss\s+yourself|stop\s+listening)(?:\s+jarvis)?(?:\s+now)?$'
@@ -1130,6 +1154,13 @@ class FastAgent:
         # Initial turn timeout
         current_timeout = max(5.0, self.follow_up_timeout)
 
+        # Ambient silence hallucinations common in Whisper / Parakeet
+        ambient_hallucinations = {
+            "you", "the", "a", "i", "oh", "so", "thank you", "thank you.",
+            "thanks for watching", "thank you for watching", "thanks for watching.",
+            "subtitles by", "subtitle by", "amara.org", "..."
+        }
+
         while self.is_running and self.is_session_active:
             if self.pill:
                 self.pill.set_state("listening")
@@ -1144,13 +1175,21 @@ class FastAgent:
                 print(f"[Session idle for {current_timeout:.1f}s -> Entering standby sleep]")
                 break
 
+            # Reject low-energy ambient breaths / mic pops
+            avg_volume = float(np.abs(audio_data).mean()) if len(audio_data) > 0 else 0
+            audio_duration = len(audio_data) / RATE
+            if audio_duration < 0.45 or avg_volume < self.noise_floor * 1.15:
+                print(f"[Low energy/ambient breath ignored ({audio_duration:.2f}s, vol={avg_volume:.1f})]")
+                continue
+
             if self.pill:
                 self.pill.set_state("processing")
 
             user_text = self.transcribe(audio_data)
             clean_text = user_text.lower().strip(" .,?!\"'")
 
-            if not clean_text or clean_text in ("", "mmhm", "mhm", "uh", "um", "ah", "hm", "huh"):
+            if not clean_text or clean_text in ambient_hallucinations or clean_text in ("", "mmhm", "mhm", "uh", "um", "ah", "hm", "huh"):
+                print(f"[Ignored ambient noise/hallucination: '{user_text}']")
                 continue
 
             # Voice dismissal / sleep check

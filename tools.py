@@ -257,9 +257,68 @@ def open_leetcode(problem_query="", browser=None):
         speech = f"I opened the LeetCode search for {clean}. To be frank, I wasn't completely sure of the direct link, so I opened the search results so you can select the exact problem."
         return action, speech
 
+def find_app_shortcut(app_name):
+    """
+    Dynamically discovers application shortcuts (.lnk, .url) and executables (.exe)
+    across Windows Desktop, Start Menu, and AppData directories.
+    Returns (path, display_name) or (None, None).
+    """
+    clean_query = (app_name or "").strip().lower()
+    clean_query = re.sub(r'^(the|open|launch|run)\s+', '', clean_query)
+    clean_query = re.sub(r'\s+(app|application|software|program|ide)$', '', clean_query).strip()
+    norm_query = re.sub(r'[^a-zA-Z0-9]', '', clean_query)
+    if not norm_query:
+        return None, None
+
+    search_dirs = [
+        os.path.join(os.path.expanduser('~'), 'Desktop'),
+        os.path.join(os.environ.get('PUBLIC', r'C:\Users\Public'), 'Desktop'),
+        os.path.join(os.environ.get('APPDATA', ''), r'Microsoft\Windows\Start Menu\Programs'),
+        os.path.join(os.environ.get('PROGRAMDATA', r'C:\ProgramData'), r'Microsoft\Windows\Start Menu\Programs'),
+        os.path.join(os.environ.get('LOCALAPPDATA', ''), 'Programs'),
+    ]
+
+    candidates = []
+    for d in search_dirs:
+        if not os.path.exists(d):
+            continue
+        try:
+            for root, _, files in os.walk(d):
+                for f in files:
+                    if f.lower().endswith(('.lnk', '.exe', '.url')):
+                        stem = os.path.splitext(f)[0]
+                        stem_lower = stem.lower()
+                        if any(bad in stem_lower for bad in ("uninstall", "remove", "help", "documentation", "readme")):
+                            continue
+                        norm_stem = re.sub(r'[^a-zA-Z0-9]', '', stem_lower)
+                        candidates.append((f, os.path.join(root, f), stem, norm_stem))
+        except Exception:
+            continue
+
+    # 1. Exact normalized match (e.g. 'antigravity' == 'antigravity')
+    for f, path, stem, norm_stem in candidates:
+        if norm_query == norm_stem:
+            return path, stem
+
+    # 2. Query is prefix or prefix match (e.g. 'blender' matches 'blender52')
+    for f, path, stem, norm_stem in candidates:
+        if norm_stem.startswith(norm_query):
+            return path, stem
+
+    # 3. Substring match
+    for f, path, stem, norm_stem in candidates:
+        if norm_query in norm_stem or norm_stem in norm_query:
+            return path, stem
+
+    return None, None
+
 def open_app(app_name):
-    """Opens local applications (Firefox, VS Code, Notepad, Terminal, Explorer, etc.)"""
-    name = app_name.strip().strip("'\"").lower()
+    """Opens local applications dynamically or via built-in shortcuts."""
+    name = (app_name or "").strip().strip("'\"").lower()
+    if not name:
+        return "Please specify an application to open."
+
+    # Built-in handlers for shell components and browsers
     if "firefox" in name:
         ff = get_firefox_exe()
         if ff:
@@ -275,6 +334,13 @@ def open_app(app_name):
         subprocess.Popen(["start", "chrome"], shell=True)
         return "Launched Chrome."
     elif "code" in name or "vscode" in name:
+        target, title = find_app_shortcut("code")
+        if target:
+            try:
+                os.startfile(target)
+                return "Launched Visual Studio Code."
+            except Exception:
+                pass
         subprocess.Popen(["code"], shell=True)
         return "Launched Visual Studio Code."
     elif "notepad" in name:
@@ -292,9 +358,27 @@ def open_app(app_name):
     elif "explorer" in name or "files" in name or "folder" in name:
         subprocess.Popen(["explorer.exe"])
         return "Opened File Explorer."
-    else:
-        subprocess.Popen(["start", app_name], shell=True)
-        return f"Attempted to open application: {app_name}"
+
+    # Dynamic application shortcut & executable discovery
+    target_path, display_title = find_app_shortcut(name)
+    if target_path:
+        try:
+            os.startfile(target_path)
+            return f"Launched {display_title}."
+        except Exception as e:
+            return f"Found {display_title} but could not launch it: {e}"
+
+    # Check system PATH executable via shutil.which
+    which_path = shutil.which(name) or shutil.which(f"{name}.exe")
+    if which_path:
+        try:
+            subprocess.Popen([which_path])
+            return f"Launched {os.path.splitext(os.path.basename(which_path))[0]}."
+        except Exception as e:
+            return f"Found {name} on PATH but failed to launch: {e}"
+
+    # Safe fallback - do not invoke 'start <name>' to prevent Windows error dialog
+    return f"I couldn't find an installed application matching '{app_name}'."
 
 def close_app(app_name):
     """Closes or terminates a running application, browser, or active window."""

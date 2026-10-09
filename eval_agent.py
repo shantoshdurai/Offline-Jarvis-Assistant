@@ -37,6 +37,17 @@ def test_dismissal_detector(is_dismissal_fn):
         ("and then i want you to shut down", True, "Request for Jarvis to shut down"),
         ("shut down", True, "Self shutdown without PC mention"),
         ("turn off", True, "Self turn off without PC mention"),
+        ("say nothing", True, "Say nothing dismissal"),
+        ("nothing", True, "Single word nothing dismissal"),
+        ("no nothing", True, "No nothing dismissal"),
+        ("nothing for now", True, "Nothing for now dismissal"),
+        ("off", True, "Direct off dismissal"),
+        ("off jarvis", True, "Off jarvis dismissal"),
+        ("never mind", True, "Never mind dismissal"),
+        ("nevermind", True, "Nevermind dismissal"),
+        ("be quiet", True, "Be quiet dismissal"),
+        ("quiet", True, "Quiet dismissal"),
+        ("stop", True, "Stop command"),
 
         # Expected False (App / System commands that must NOT trigger self-sleep)
         ("close the chrome", False, "Close app command"),
@@ -152,6 +163,17 @@ def test_tool_dispatch():
     res_search = tools.search_local_files("fast_agent.py")
     print("  Search File (fast_agent.py):", res_search.split("\n")[0])
     assert "fast_agent.py" in res_search
+
+    # 5. Dynamic App Resolver (resolves installed software without hardcoding)
+    antigravity_path, name = tools.find_app_shortcut("antigravity")
+    print(f"  App Resolver ('antigravity'): {name} -> {antigravity_path}")
+    assert antigravity_path is not None, "Failed to resolve Antigravity shortcut"
+
+    # 6. Safe open_app without Windows popup
+    res_missing = tools.open_app("nonexistent_unknown_software_999")
+    print("  Open App (missing fallback):", res_missing)
+    assert "couldn't find" in res_missing.lower()
+
     print("Tool Execution Suite: 100% Passed.")
 
 
