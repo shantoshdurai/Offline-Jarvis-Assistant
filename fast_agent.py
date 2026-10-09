@@ -38,6 +38,7 @@ except Exception:
     pass
 
 import time
+import math
 import re
 import json
 import queue
@@ -907,6 +908,10 @@ class FastAgent:
         talking_started = bool(pre_roll_chunks and len(pre_roll_chunks) > 0)
         talking_start_chunk = 0
 
+        # Ring buffer for preserving initial pre-speech syllable without accumulating ambient room noise
+        silence_pre_buffer = collections.deque(maxlen=4)
+        consecutive_speech_chunks = 0
+
         if self.pill:
             self.pill.set_state("recording")
 
@@ -924,7 +929,6 @@ class FastAgent:
                     break
 
                 data = self.mic_stream.read(CHUNK, exception_on_overflow=False)
-                frames.append(data)
 
                 audio_data = np.frombuffer(data, dtype=np.int16)
                 volume = np.abs(audio_data).mean()
@@ -934,17 +938,32 @@ class FastAgent:
                     norm = min(1.0, max(0.0, (volume - self.noise_floor) / max(600, self.speech_threshold - self.noise_floor + 200)))
                     self.pill.update_volume(norm)
 
-                if volume > self.speech_threshold:
-                    if not talking_started:
-                        talking_started = True
-                        talking_start_chunk = i
-                    silent_chunks = 0
-                elif talking_started:
-                    silent_chunks += 1
+                if not talking_started:
+                    if volume > self.speech_threshold:
+                        consecutive_speech_chunks += 1
+                        # Require 2 consecutive speech chunks (~64ms) to confirm genuine voice (rejects transient clicks/breaths)
+                        if consecutive_speech_chunks >= 2:
+                            talking_started = True
+                            talking_start_chunk = i
+                            frames = list(silence_pre_buffer)
+                            frames.append(data)
+                            silent_chunks = 0
+                    else:
+                        consecutive_speech_chunks = 0
+                        silence_pre_buffer.append(data)
 
-                # Adaptive conversational pause: once speech has been going on for > 1.0s,
-                # extend the silence window slightly (e.g. 1.4s) to allow natural breathing/thought pauses
-                if talking_started:
+                    if i > timeout_chunks:
+                        # Timeout reached with no genuine speech detected -> return empty audio
+                        break
+                else:
+                    frames.append(data)
+                    if volume > self.speech_threshold:
+                        silent_chunks = 0
+                    else:
+                        silent_chunks += 1
+
+                    # Adaptive conversational pause: once speech has been going on for > 1.0s,
+                    # extend the silence window slightly (e.g. 1.4s) to allow natural breathing/thought pauses
                     spoken_duration = (i - talking_start_chunk) * (CHUNK / RATE)
                     effective_silence = max(silence_limit, 1.4) if spoken_duration > 1.0 else silence_limit
                     if silent_chunks > int(effective_silence * chunks_per_sec):
@@ -952,9 +971,6 @@ class FastAgent:
                         if self.pill:
                             self.pill.set_state("processing")
                         break
-
-                if not talking_started and i > timeout_chunks:
-                    break
 
             if not talking_started or not frames:
                 return np.zeros(0, dtype=np.int16)
@@ -1206,12 +1222,39 @@ class FastAgent:
             asyncio.run(generate_speech())
             tts_gen_time = time.time() - t0_gen
             if os.path.exists(temp_audio):
+                envelope = None
+                env_sr = 24000
+                try:
+                    import soundfile as sf
+                    data, env_sr = sf.read(temp_audio)
+                    if data.ndim > 1:
+                        data = data.mean(axis=1)
+                    envelope = np.abs(data)
+                except Exception:
+                    envelope = None
+
                 pygame.mixer.music.load(temp_audio)
                 if self.pill:
                     self.pill.set_state("speaking")
                 pygame.mixer.music.play()
+                t_play_start = time.time()
                 while pygame.mixer.music.get_busy():
-                    time.sleep(0.04)
+                    elapsed = time.time() - t_play_start
+                    if envelope is not None and len(envelope) > 0:
+                        idx = int(elapsed * env_sr)
+                        chunk_size = int(env_sr * 0.04)
+                        sample_slice = envelope[idx:idx + chunk_size]
+                        if len(sample_slice) > 0:
+                            raw_rms = float(np.mean(sample_slice))
+                            norm_vol = min(1.0, max(0.0, raw_rms * 4.5))
+                        else:
+                            norm_vol = 0.0
+                    else:
+                        norm_vol = 0.35 + 0.45 * (math.sin(elapsed * 10.0) * math.cos(elapsed * 5.5)) ** 2
+                    if self.pill:
+                        self.pill.update_volume(norm_vol)
+                    time.sleep(0.035)
+
                 pygame.mixer.music.unload()
                 try:
                     os.remove(temp_audio)
@@ -1224,11 +1267,28 @@ class FastAgent:
                 if self.sapi_engine:
                     if self.pill:
                         self.pill.set_state("speaking")
-                    self.sapi_engine.say(clean_text)
-                    self.sapi_engine.runAndWait()
+                    sapi_busy = threading.Event()
+                    sapi_busy.set()
+                    def animate_sapi():
+                        t0_s = time.time()
+                        while sapi_busy.is_set():
+                            el = time.time() - t0_s
+                            v = 0.35 + 0.45 * (math.sin(el * 10.0) * math.cos(el * 5.5)) ** 2
+                            if self.pill:
+                                self.pill.update_volume(v)
+                            time.sleep(0.035)
+                    th = threading.Thread(target=animate_sapi, daemon=True)
+                    th.start()
+                    try:
+                        self.sapi_engine.say(clean_text)
+                        self.sapi_engine.runAndWait()
+                    finally:
+                        sapi_busy.clear()
             except Exception:
                 pass
         finally:
+            if self.pill:
+                self.pill.update_volume(0.0)
             # Echo prevention
             time.sleep(0.2)
             try:
@@ -1347,6 +1407,21 @@ class FastAgent:
             "subtitles by", "subtitle by", "amara.org", "..."
         }
 
+        # OpenWhispr Repeated Word Hallucination Detection (matching dictionaryEchoFilter.js)
+        def is_hallucinated_repetition(text: str) -> bool:
+            clean = re.sub(r'[^\w\s]', '', text.lower()).strip()
+            words = clean.split()
+            if len(words) < 3:
+                return False
+            # Check 3+ consecutive identical words: e.g. "red red red"
+            for i in range(len(words) - 2):
+                if words[i] == words[i+1] == words[i+2]:
+                    return True
+            counts = collections.Counter(words)
+            if any(c >= 3 for c in counts.values()) and (len(counts) / len(words)) < 0.6:
+                return True
+            return False
+
         turn = 0
         while self.is_running and self.is_session_active:
             turn += 1
@@ -1370,11 +1445,9 @@ class FastAgent:
             # Reject low-energy ambient breaths / mic pops
             avg_volume = float(np.abs(audio_data).mean()) if len(audio_data) > 0 else 0
             audio_duration = len(audio_data) / RATE
-            if audio_duration < 0.45 or avg_volume < self.noise_floor * 1.15:
-                print(f"[Low energy/ambient breath ignored ({audio_duration:.2f}s, vol={avg_volume:.1f})]")
-                if turn > 1 and self.follow_up_timeout <= 0:
-                    break
-                continue
+            if audio_duration < 0.45 or avg_volume < self.noise_floor * 1.2:
+                print(f"[Low energy/ambient breath ignored ({audio_duration:.2f}s, vol={avg_volume:.1f}) -> Standby sleep]")
+                break
 
             if self.pill:
                 self.pill.set_state("processing")
@@ -1385,10 +1458,13 @@ class FastAgent:
             clean_text = user_text.lower().strip(" .,?!\"'")
 
             if not clean_text or clean_text in ambient_hallucinations or clean_text in ("", "mmhm", "mhm", "uh", "um", "ah", "hm", "huh"):
-                print(f"[Ignored ambient noise/hallucination: '{user_text}']")
-                if turn > 1 and self.follow_up_timeout <= 0:
-                    break
-                continue
+                print(f"[Ignored ambient noise/hallucination: '{user_text}'] -> Entering standby sleep")
+                break
+
+            if is_hallucinated_repetition(user_text):
+                print(f"[Ignored repeated-word silence hallucination: '{user_text}'] -> Entering standby sleep")
+                break
+
 
             # Voice dismissal / sleep check
             if self.is_dismissal_command(clean_text):
