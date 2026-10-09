@@ -44,6 +44,7 @@ import queue
 import socket
 import asyncio
 import threading
+import collections
 import subprocess
 import urllib.request
 import urllib.parse
@@ -76,7 +77,7 @@ except ImportError:
 
 # Local modules
 import tools
-from parakeet_stt import ParakeetEOU, ParakeetTDT, get_best_stt_engine
+from parakeet_stt import ParakeetTDT, get_best_stt_engine
 from overlay_widget import FloatingVoicePill
 from dashboard_gui import JarvisDashboard, load_config, save_config
 
@@ -553,11 +554,12 @@ class FastAgent:
 
         # Load persistent configuration
         self.config = load_config()
-        self.follow_up_timeout = float(self.config.get("follow_up_timeout", 10.0))
+        self.follow_up_timeout = float(self.config.get("follow_up_timeout", 0.0))
         self.silence_limit = float(self.config.get("silence_limit", 1.2))
         self.sfx_enabled = bool(self.config.get("sfx_enabled", True))
         self.voice_dismissal_enabled = bool(self.config.get("voice_dismissal_enabled", True))
         self.wake_word_enabled = bool(self.config.get("wake_word_enabled", True))
+        self.wake_words = [w.lower().strip() for w in self.config.get("wake_words", ["hey jarvis", "jarvis"])]
 
         self.manual_stop_recording = threading.Event()
         self.is_recording_active = False
@@ -581,7 +583,7 @@ class FastAgent:
             print(f"[Notice] Floating overlay error: {e}")
             self.pill = None
 
-        # 3. Speech Recognizer (Prioritizes 622MB Parakeet-TDT, fallbacks to 120MB EOU or Whisper)
+        # 3. Dedicated Speech Recognizer: NVIDIA Parakeet-TDT 0.6B (622MB)
         self.stt = None
         try:
             self.stt = get_best_stt_engine()
@@ -590,14 +592,9 @@ class FastAgent:
 
         self.whisper_model = None
 
-        # 4. OpenWakeWord Model ('Hey Jarvis')
+        # 4. OpenWakeWord Continuous Model Engine
         self.oww = None
-        try:
-            from openwakeword.model import Model
-            self.oww = Model(wakeword_models=["hey_jarvis"], inference_framework="onnx")
-            print("[OK] Continuous Wake Word active ('Hey Jarvis')")
-        except Exception as e:
-            print(f"[Warning] OpenWakeWord error ({e}).")
+        self._load_wake_models()
 
         # 5. Microphone Stream
         self.audio = pyaudio.PyAudio()
@@ -663,17 +660,44 @@ class FastAgent:
         self.config["wake_word_enabled"] = enabled
         save_config(self.config)
 
+    def _load_wake_models(self):
+        """Loads openwakeword model(s) matching configured wake words."""
+        models = []
+        ww = [w.lower() for w in self.wake_words]
+        if any("jarvis" in w for w in ww):
+            models.append("hey_jarvis")
+        if any("alexa" in w for w in ww):
+            models.append("alexa")
+        if any("mycroft" in w for w in ww):
+            models.append("hey_mycroft")
+        if any("weather" in w for w in ww):
+            models.append("weather")
+        if any("timer" in w for w in ww):
+            models.append("timer")
+        if not models:
+            models = ["hey_jarvis"]
+
+        try:
+            from openwakeword.model import Model
+            self.oww = Model(wakeword_models=models, inference_framework="onnx")
+            print(f"[OK] Wake Word Engine active for models: {models} | Configured phrases: {self.wake_words}")
+        except Exception as e:
+            print(f"[Warning] OpenWakeWord error ({e}).")
+            self.oww = None
+
     def on_update_settings(self, new_cfg: Dict[str, Any]):
         self.config.update(new_cfg)
-        self.follow_up_timeout = float(self.config.get("follow_up_timeout", 10.0))
-        self.silence_limit = float(self.config.get("silence_limit", 0.55))
+        self.follow_up_timeout = float(self.config.get("follow_up_timeout", 0.0))
+        self.silence_limit = float(self.config.get("silence_limit", 1.2))
         self.sfx_enabled = bool(self.config.get("sfx_enabled", True))
         if self.pill:
             self.pill.sfx_enabled = self.sfx_enabled
         self.voice_dismissal_enabled = bool(self.config.get("voice_dismissal_enabled", True))
         self.wake_word_enabled = bool(self.config.get("wake_word_enabled", True))
+        self.wake_words = [w.lower().strip() for w in self.config.get("wake_words", ["hey jarvis", "jarvis"])]
+        self._load_wake_models()
         save_config(self.config)
-        print(f"[Settings Updated] FollowUp={self.follow_up_timeout}s | SilenceLimit={self.silence_limit}s | SFX={self.sfx_enabled} | Dismissal={self.voice_dismissal_enabled}")
+        print(f"[Settings Updated] FollowUp={self.follow_up_timeout}s | SilenceLimit={self.silence_limit}s | WakeWords={self.wake_words}")
 
     def save_api_key(self, key: str):
         global OPENROUTER_API_KEY
@@ -824,9 +848,15 @@ class FastAgent:
             self.whisper_model = WhisperModel("base.en", device="cpu", compute_type="int8")
         return self.whisper_model
 
-    def record_audio(self, max_duration: float = 12.0, silence_limit: Optional[float] = None, start_timeout: Optional[float] = None) -> np.ndarray:
+    def record_audio(
+        self,
+        pre_roll_chunks: Optional[List[bytes]] = None,
+        max_duration: float = 12.0,
+        silence_limit: Optional[float] = None,
+        start_timeout: Optional[float] = None
+    ) -> np.ndarray:
         """Records voice with live waveform equalizer on floating pill, adaptive conversational pause,
-        and manual toggle-to-stop control.
+        and manual toggle-to-stop control. Retains pre_roll_chunks for continuous wake word flows.
         """
         if silence_limit is None:
             silence_limit = self.silence_limit
@@ -838,22 +868,28 @@ class FastAgent:
         if hasattr(self, "dashboard") and self.dashboard:
             self.dashboard.set_recording_state(True)
 
-        frames = []
+        frames = list(pre_roll_chunks) if pre_roll_chunks else []
         silent_chunks = 0
         chunks_per_sec = RATE / CHUNK
         max_total_chunks = int(max_duration * chunks_per_sec)
         timeout_chunks = int(start_timeout * chunks_per_sec)
-        talking_started = False
+        talking_started = bool(pre_roll_chunks and len(pre_roll_chunks) > 0)
         talking_start_chunk = 0
 
+        if self.pill:
+            self.pill.set_state("recording")
+
         try:
-            # Flush stale mic buffer
-            while self.mic_stream.get_read_available() > 0:
-                self.mic_stream.read(self.mic_stream.get_read_available(), exception_on_overflow=False)
+            # Only flush stale mic buffer if starting from a fresh hotkey press (not continuous wake word flow)
+            if not pre_roll_chunks:
+                while self.mic_stream.get_read_available() > 0:
+                    self.mic_stream.read(self.mic_stream.get_read_available(), exception_on_overflow=False)
 
             for i in range(max_total_chunks):
                 if self.manual_stop_recording.is_set():
                     print("[Manual Stop] User stopped recording via button/hotkey.")
+                    if self.pill:
+                        self.pill.set_state("processing")
                     break
 
                 data = self.mic_stream.read(CHUNK, exception_on_overflow=False)
@@ -871,8 +907,6 @@ class FastAgent:
                     if not talking_started:
                         talking_started = True
                         talking_start_chunk = i
-                        if self.pill:
-                            self.pill.set_state("recording")
                     silent_chunks = 0
                 elif talking_started:
                     silent_chunks += 1
@@ -883,6 +917,9 @@ class FastAgent:
                     spoken_duration = (i - talking_start_chunk) * (CHUNK / RATE)
                     effective_silence = max(silence_limit, 1.4) if spoken_duration > 1.0 else silence_limit
                     if silent_chunks > int(effective_silence * chunks_per_sec):
+                        # Silence detected! Transition immediately to processing state
+                        if self.pill:
+                            self.pill.set_state("processing")
                         break
 
                 if not talking_started and i > timeout_chunks:
@@ -899,7 +936,7 @@ class FastAgent:
                 self.dashboard.set_recording_state(False)
 
     def transcribe(self, audio_data: np.ndarray) -> str:
-        """Transcribe speech using Parakeet-TDT (622MB) or Parakeet-EOU (120MB), with Whisper fallback."""
+        """Transcribe speech using dedicated NVIDIA Parakeet-TDT (622MB) engine."""
         if len(audio_data) < RATE * 0.4:
             return ""
 
@@ -1002,9 +1039,18 @@ class FastAgent:
                 self.pill.set_state("idle")
             return
 
+        # Strip configured wake words from the start of the speech for seamless continuous flow
+        # e.g. "hey jarvis open youtube" -> "open youtube"
+        for ww in sorted(self.wake_words, key=len, reverse=True):
+            ww_clean = ww.lower().strip()
+            if clean_text.startswith(ww_clean):
+                remainder = clean_text[len(ww_clean):].strip(" ,:.-?!")
+                if remainder:
+                    user_text = remainder
+                    clean_text = remainder
+                break
+
         if self.is_dismissal_command(clean_text):
-            if self.pill:
-                self.pill.set_state("speaking")
             t_tts = self.tts_speak("Standing by.")
             t_total = t_stt + t_tts
             self.dashboard.add_interaction(
@@ -1061,10 +1107,7 @@ class FastAgent:
 
         self.history.append({"role": "assistant", "content": spoken_response})
 
-        if self.pill:
-            self.pill.set_state("speaking")
-
-        # 3. TTS Speech Synthesis
+        # 3. TTS Speech Synthesis (pill state transitions to speaking when audio playback begins)
         t_tts = self.tts_speak(cleaned_speech)
 
         # 4. Latency Aggregation & Reporting
@@ -1118,6 +1161,8 @@ class FastAgent:
             tts_gen_time = time.time() - t0_gen
             if os.path.exists(temp_audio):
                 pygame.mixer.music.load(temp_audio)
+                if self.pill:
+                    self.pill.set_state("speaking")
                 pygame.mixer.music.play()
                 while pygame.mixer.music.get_busy():
                     time.sleep(0.04)
@@ -1131,13 +1176,15 @@ class FastAgent:
             tts_gen_time = time.time() - t0_gen
             try:
                 if self.sapi_engine:
+                    if self.pill:
+                        self.pill.set_state("speaking")
                     self.sapi_engine.say(clean_text)
                     self.sapi_engine.runAndWait()
             except Exception:
                 pass
         finally:
             # Echo prevention
-            time.sleep(0.35)
+            time.sleep(0.2)
             try:
                 while self.mic_stream.get_read_available() > 0:
                     self.mic_stream.read(self.mic_stream.get_read_available(), exception_on_overflow=False)
@@ -1152,7 +1199,7 @@ class FastAgent:
                     break
             self.is_speaking.clear()
             if self.pill:
-                if self.is_session_active:
+                if self.is_session_active and self.follow_up_timeout > 0.0:
                     self.pill.set_state("listening")
                 else:
                     self.pill.set_state("idle")
@@ -1233,20 +1280,17 @@ class FastAgent:
                 return True
         return False
 
-    def handle_conversation_session(self):
+    def handle_conversation_session(self, pre_roll_chunks: Optional[List[bytes]] = None):
         """Active conversational session loop.
         Listens, responds, and remains open for follow-up questions
-        for up to follow_up_timeout seconds (default 10s) before going to sleep.
+        if follow_up_timeout > 0, otherwise completes turn and sleeps immediately.
         """
         self.is_session_active = True
         self.is_listening.set()
 
-        # Play wake chime ONCE when session begins
+        # Play wake chime non-blocking ONCE when session begins
         if self.sfx_enabled:
-            self.play_chime("wake")
-
-        # Initial turn timeout
-        current_timeout = max(5.0, self.follow_up_timeout)
+            threading.Thread(target=self.play_chime, args=("wake",), daemon=True).start()
 
         # Ambient silence hallucinations common in Whisper / Parakeet
         ambient_hallucinations = {
@@ -1255,18 +1299,24 @@ class FastAgent:
             "subtitles by", "subtitle by", "amara.org", "..."
         }
 
+        turn = 0
         while self.is_running and self.is_session_active:
+            turn += 1
             if self.pill:
                 self.pill.set_state("listening")
 
+            current_pre_roll = pre_roll_chunks if turn == 1 else None
+            start_to = max(5.0, self.follow_up_timeout) if turn == 1 else self.follow_up_timeout
+
             audio_data = self.record_audio(
+                pre_roll_chunks=current_pre_roll,
                 max_duration=12.0,
                 silence_limit=self.silence_limit,
-                start_timeout=current_timeout
+                start_timeout=start_to
             )
 
             if len(audio_data) == 0:
-                print(f"[Session idle for {current_timeout:.1f}s -> Entering standby sleep]")
+                print(f"[Session idle -> Entering standby sleep]")
                 break
 
             # Reject low-energy ambient breaths / mic pops
@@ -1274,6 +1324,8 @@ class FastAgent:
             audio_duration = len(audio_data) / RATE
             if audio_duration < 0.45 or avg_volume < self.noise_floor * 1.15:
                 print(f"[Low energy/ambient breath ignored ({audio_duration:.2f}s, vol={avg_volume:.1f})]")
+                if turn > 1 and self.follow_up_timeout <= 0:
+                    break
                 continue
 
             if self.pill:
@@ -1286,13 +1338,13 @@ class FastAgent:
 
             if not clean_text or clean_text in ambient_hallucinations or clean_text in ("", "mmhm", "mhm", "uh", "um", "ah", "hm", "huh"):
                 print(f"[Ignored ambient noise/hallucination: '{user_text}']")
+                if turn > 1 and self.follow_up_timeout <= 0:
+                    break
                 continue
 
             # Voice dismissal / sleep check
             if self.is_dismissal_command(clean_text):
                 print(f"[Voice Dismissal: '{user_text}'] -> Entering standby sleep")
-                if self.pill:
-                    self.pill.set_state("speaking")
                 t_tts = self.tts_speak("Standing by.")
                 t_total = t_stt + t_tts
                 self.dashboard.add_interaction(
@@ -1307,35 +1359,40 @@ class FastAgent:
             # Execute normal command
             self.execute_command_pipeline(user_text, source="voice", t_stt=t_stt)
 
-            # After response, keep session open for follow_up_timeout (default 10s)
-            current_timeout = self.follow_up_timeout
+            # If follow up timeout is 0 (Off), finish turn immediately
+            if self.follow_up_timeout <= 0.0:
+                break
 
         # Terminate session & enter standby sleep
         self.is_session_active = False
         if self.pill:
             self.pill.set_state("idle")
         if self.sfx_enabled:
-            self.play_chime("sleep")
+            threading.Thread(target=self.play_chime, args=("sleep",), daemon=True).start()
         self.is_listening.clear()
 
     def _wake_word_listener(self):
-        """Continuous mic listening for 'Hey Jarvis'."""
+        """Continuous mic listening for configured wake words with pre-roll buffer for continuous speech flow."""
         if self.oww is None:
             return
 
+        pre_roll = collections.deque(maxlen=16)  # ~1.28s audio history at 16kHz
         while self.is_running:
             try:
                 if self.wake_word_enabled and not self.is_listening.is_set() and not self.is_speaking.is_set() and not self.is_session_active:
                     data = self.mic_stream.read(CHUNK, exception_on_overflow=False)
+                    pre_roll.append(data)
                     audio_data = np.frombuffer(data, dtype=np.int16)
                     prediction = self.oww.predict(audio_data)
                     score = max(prediction.values()) if prediction else 0.0
 
                     if score > WAKE_THRESHOLD:
-                        print(f"\n[Wake Word: Hey Jarvis (score={score:.2f})]")
+                        print(f"\n[Wake Word Detected (score={score:.2f})]")
                         self.oww.reset()
                         self.is_listening.set()
-                        self.command_queue.put("TRIGGER")
+                        captured_pre_roll = list(pre_roll)
+                        pre_roll.clear()
+                        self.command_queue.put(("WAKE_TRIGGER", captured_pre_roll))
                 else:
                     time.sleep(0.08)
             except OSError:
@@ -1347,12 +1404,15 @@ class FastAgent:
         """Background loop executing queued voice triggers."""
         while self.is_running:
             try:
-                trigger = self.command_queue.get(timeout=0.2)
+                item = self.command_queue.get(timeout=0.2)
             except queue.Empty:
                 continue
 
-            if trigger == "TRIGGER":
-                self.handle_conversation_session()
+            if isinstance(item, tuple) and item[0] == "WAKE_TRIGGER":
+                pre_roll = item[1]
+                self.handle_conversation_session(pre_roll_chunks=pre_roll)
+            elif item == "TRIGGER":
+                self.handle_conversation_session(pre_roll_chunks=None)
 
     def _terminal_input_loop(self):
         """Console keyboard input loop when --console is active."""

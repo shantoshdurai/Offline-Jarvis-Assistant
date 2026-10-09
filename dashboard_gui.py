@@ -53,11 +53,12 @@ def save_history(history: List[Dict[str, Any]]):
 CONFIG_FILE = os.path.join(BASE_DIR, "config.json")
 
 DEFAULT_CONFIG = {
-    "follow_up_timeout": 10.0,
+    "follow_up_timeout": 0.0,
     "silence_limit": 1.2,
     "sfx_enabled": True,
     "voice_dismissal_enabled": True,
     "wake_word_enabled": True,
+    "wake_words": ["hey jarvis", "jarvis"],
 }
 
 
@@ -1016,10 +1017,11 @@ class JarvisDashboard:
         row1.pack(fill="x", padx=14, pady=(8, 2))
         ctk.CTkLabel(row1, text="Follow-Up Listening Window:", font=ctk.CTkFont(size=12, weight="bold"), text_color="#f8fafc").pack(side="left")
         
-        curr_timeout_str = f"{int(self.config.get('follow_up_timeout', 10))}s"
+        curr_timeout = float(self.config.get("follow_up_timeout", 0.0))
+        curr_timeout_str = "Off" if curr_timeout <= 0.0 else f"{int(curr_timeout)}s"
         self.timeout_seg = ctk.CTkSegmentedButton(
             row1,
-            values=["5s", "10s", "15s", "20s", "30s"],
+            values=["Off", "5s", "10s", "15s", "20s"],
             command=self._on_timeout_change,
             selected_color="#2563eb",
             height=28
@@ -1029,7 +1031,7 @@ class JarvisDashboard:
 
         ctk.CTkLabel(
             s1,
-            text="Keeps mic open for follow-up questions without needing the hotkey again.",
+            text="Keeps mic open for follow-up questions without needing the hotkey again (set Off for quiet standby).",
             font=ctk.CTkFont(size=10),
             text_color="#64748b"
         ).pack(anchor="w", padx=14, pady=(0, 8))
@@ -1094,23 +1096,62 @@ class JarvisDashboard:
             text_color="#64748b"
         ).pack(anchor="w", padx=14, pady=(0, 12))
 
-        # Section 2: Hotkeys & Wake Word
-        s2 = self._create_settings_section(settings_frame, "Push-to-Talk & Wake Word")
+        # Section 2: Hotkeys & Wake Words
+        s2 = self._create_settings_section(settings_frame, "Push-to-Talk & Wake Words")
 
         row_hk = ctk.CTkFrame(s2, fg_color="transparent")
-        row_hk.pack(fill="x", padx=14, pady=8)
+        row_hk.pack(fill="x", padx=14, pady=6)
         ctk.CTkLabel(row_hk, text="Push-to-Talk Shortcuts:", font=ctk.CTkFont(size=12, weight="bold"), text_color="#f8fafc").pack(side="left")
         ctk.CTkLabel(row_hk, text="Ctrl+Shift+Space  |  Ctrl+Alt+J  |  Ctrl+Win", font=ctk.CTkFont(size=12), text_color="#38bdf8").pack(side="right")
 
         row_ww = ctk.CTkFrame(s2, fg_color="transparent")
-        row_ww.pack(fill="x", padx=14, pady=8)
-        ctk.CTkLabel(row_ww, text="Wake Word ('Hey Jarvis'):", font=ctk.CTkFont(size=12, weight="bold"), text_color="#f8fafc").pack(side="left")
+        row_ww.pack(fill="x", padx=14, pady=6)
+        ctk.CTkLabel(row_ww, text="Wake Word Listener:", font=ctk.CTkFont(size=12, weight="bold"), text_color="#f8fafc").pack(side="left")
         self.wake_switch = ctk.CTkSwitch(row_ww, text="Active", command=self._toggle_wake)
         if self.config.get("wake_word_enabled", True):
             self.wake_switch.select()
         else:
             self.wake_switch.deselect()
         self.wake_switch.pack(side="right")
+
+        # Configured Wake Words Container
+        row_words_title = ctk.CTkFrame(s2, fg_color="transparent")
+        row_words_title.pack(fill="x", padx=14, pady=(8, 2))
+        ctk.CTkLabel(row_words_title, text="Active Wake Words & Phrases:", font=ctk.CTkFont(size=12, weight="bold"), text_color="#f8fafc").pack(side="left")
+
+        self.wake_words_chips_frame = ctk.CTkFrame(s2, fg_color="transparent")
+        self.wake_words_chips_frame.pack(fill="x", padx=14, pady=(2, 6))
+
+        # Add new wake word row
+        row_add_ww = ctk.CTkFrame(s2, fg_color="transparent")
+        row_add_ww.pack(fill="x", padx=14, pady=(4, 12))
+        row_add_ww.grid_columnconfigure(0, weight=1)
+
+        self.new_ww_entry = ctk.CTkEntry(
+            row_add_ww,
+            placeholder_text="Enter new wake word or phrase (e.g. computer, alexa, hey copilot)...",
+            fg_color="#101117",
+            border_color="#232532",
+            height=32,
+            corner_radius=6
+        )
+        self.new_ww_entry.grid(row=0, column=0, sticky="ew", padx=(0, 8))
+        self.new_ww_entry.bind("<Return>", lambda e: self._add_wake_word())
+
+        btn_add_ww = ctk.CTkButton(
+            row_add_ww,
+            text="+ Add Word",
+            font=ctk.CTkFont(size=11, weight="bold"),
+            fg_color="#2563eb",
+            hover_color="#1d4ed8",
+            width=90,
+            height=32,
+            corner_radius=6,
+            command=self._add_wake_word
+        )
+        btn_add_ww.grid(row=0, column=1)
+
+        self._render_wake_word_chips()
 
         # Section 3: AI Models & API Key
         s3 = self._create_settings_section(settings_frame, "AI Model & OpenRouter API")
@@ -1123,7 +1164,7 @@ class JarvisDashboard:
         row_m2 = ctk.CTkFrame(s3, fg_color="transparent")
         row_m2.pack(fill="x", padx=14, pady=8)
         ctk.CTkLabel(row_m2, text="Speech STT Engine:", font=ctk.CTkFont(size=12, weight="bold"), text_color="#f8fafc").pack(side="left")
-        ctk.CTkLabel(row_m2, text="NVIDIA Parakeet-TDT 0.6B (622MB OpenWhispr, 300ms) / EOU", font=ctk.CTkFont(size=12), text_color="#10b981").pack(side="right")
+        ctk.CTkLabel(row_m2, text="NVIDIA Parakeet-TDT 0.6B (622MB, 300ms inference)", font=ctk.CTkFont(size=12), text_color="#10b981").pack(side="right")
 
         row_key = ctk.CTkFrame(s3, fg_color="transparent")
         row_key.pack(fill="x", padx=14, pady=(8, 14))
@@ -1173,9 +1214,77 @@ class JarvisDashboard:
         t_lbl.pack(anchor="w", padx=14, pady=(10, 4))
         return container
 
+    def _render_wake_word_chips(self):
+        """Renders interactive chips for each active wake word."""
+        if not hasattr(self, "wake_words_chips_frame"):
+            return
+        for w in self.wake_words_chips_frame.winfo_children():
+            w.destroy()
+
+        words = self.config.get("wake_words", ["hey jarvis", "jarvis"])
+        if not words:
+            ctk.CTkLabel(
+                self.wake_words_chips_frame,
+                text="No wake words configured. Enter a word or phrase above.",
+                font=ctk.CTkFont(size=11),
+                text_color="#64748b"
+            ).pack(anchor="w")
+            return
+
+        flow_frame = ctk.CTkFrame(self.wake_words_chips_frame, fg_color="transparent")
+        flow_frame.pack(fill="x", anchor="w")
+
+        for word in words:
+            chip = ctk.CTkFrame(flow_frame, fg_color="#1e293b", corner_radius=6)
+            chip.pack(side="left", padx=(0, 6), pady=2)
+
+            ctk.CTkLabel(
+                chip,
+                text=f"🎙️  {word}",
+                font=ctk.CTkFont(size=11, weight="bold"),
+                text_color="#38bdf8"
+            ).pack(side="left", padx=(8, 4), pady=3)
+
+            btn_del = ctk.CTkButton(
+                chip,
+                text="✕",
+                font=ctk.CTkFont(size=10, weight="bold"),
+                fg_color="transparent",
+                text_color="#ef4444",
+                hover_color="#334155",
+                width=20,
+                height=20,
+                command=lambda w=word: self._remove_wake_word(w)
+            )
+            btn_del.pack(side="left", padx=(0, 4), pady=3)
+
+    def _add_wake_word(self):
+        val = self.new_ww_entry.get().strip().lower()
+        if not val:
+            return
+        words = list(self.config.get("wake_words", ["hey jarvis", "jarvis"]))
+        if val not in words:
+            words.append(val)
+            self.config["wake_words"] = words
+            save_config(self.config)
+            self._render_wake_word_chips()
+            self.new_ww_entry.delete(0, "end")
+            if self.on_update_settings:
+                self.on_update_settings(self.config)
+
+    def _remove_wake_word(self, word: str):
+        words = list(self.config.get("wake_words", ["hey jarvis", "jarvis"]))
+        if word in words:
+            words.remove(word)
+            self.config["wake_words"] = words
+            save_config(self.config)
+            self._render_wake_word_chips()
+            if self.on_update_settings:
+                self.on_update_settings(self.config)
+
     def _on_timeout_change(self, value: str):
         try:
-            val = float(value.replace("s", ""))
+            val = 0.0 if value == "Off" else float(value.replace("s", ""))
             self.config["follow_up_timeout"] = val
             save_config(self.config)
             if self.on_update_settings:

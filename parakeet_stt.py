@@ -275,17 +275,11 @@ class ParakeetTDT:
 
 
 def get_best_stt_engine():
-    """Discovers and returns the fastest, highest-accuracy STT engine available."""
+    """Discovers and returns the NVIDIA Parakeet-TDT 0.6B (622MB) STT engine."""
     try:
         tdt = ParakeetTDT()
-        print("[OK] Active STT: NVIDIA Parakeet-TDT 0.6B (622MB OpenWhispr model, 300ms latency)")
+        print("[OK] Active STT: NVIDIA Parakeet-TDT 0.6B (622MB, sub-300ms latency)")
         return tdt
     except Exception as e:
-        print(f"[Notice] Parakeet-TDT not found ({e}). Falling back to Parakeet-EOU 120M.")
-        try:
-            eou = ParakeetEOU()
-            print("[OK] Active STT: NVIDIA Parakeet-EOU INT8 (120MB)")
-            return eou
-        except Exception as e2:
-            print(f"[Notice] Parakeet-EOU not found ({e2}). Faster-Whisper active as fallback.")
-            return None
+        print(f"[Warning] Parakeet-TDT error ({e}).")
+        return None
