@@ -53,7 +53,7 @@ def save_history(history: List[Dict[str, Any]]):
 CONFIG_FILE = os.path.join(BASE_DIR, "config.json")
 
 DEFAULT_CONFIG = {
-    "follow_up_timeout": 0.0,
+    "follow_up_timeout": 8.0,
     "silence_limit": 1.2,
     "sfx_enabled": True,
     "voice_dismissal_enabled": True,
@@ -90,6 +90,7 @@ class JarvisDashboard:
         on_save_api_key: Optional[Callable[[str], None]] = None,
         on_toggle_wake_word: Optional[Callable[[bool], None]] = None,
         on_update_settings: Optional[Callable[[Dict[str, Any]], None]] = None,
+        on_clear_history: Optional[Callable[[], None]] = None,
     ):
         self.on_trigger_voice = on_trigger_voice
         self.on_send_chat = on_send_chat
@@ -97,6 +98,7 @@ class JarvisDashboard:
         self.on_save_api_key = on_save_api_key
         self.on_toggle_wake_word = on_toggle_wake_word
         self.on_update_settings = on_update_settings
+        self.on_clear_history = on_clear_history
 
         self.config = load_config()
         self.history = load_history()
@@ -389,9 +391,10 @@ class JarvisDashboard:
         home_frame.grid_rowconfigure(1, weight=1)
         home_frame.grid_columnconfigure(0, weight=1)
 
-        # Search / Filter Bar
+        # Search / Filter Bar + Clear All Button
         search_frame = ctk.CTkFrame(home_frame, fg_color="transparent", height=36)
         search_frame.grid(row=0, column=0, sticky="ew", pady=(0, 10))
+        search_frame.grid_columnconfigure(0, weight=1)
 
         self.search_entry = ctk.CTkEntry(
             search_frame,
@@ -403,8 +406,22 @@ class JarvisDashboard:
             height=36,
             corner_radius=8
         )
-        self.search_entry.pack(fill="x")
+        self.search_entry.grid(row=0, column=0, sticky="ew", padx=(0, 8))
         self.search_entry.bind("<KeyRelease>", lambda e: self._filter_history())
+
+        btn_clear_all = ctk.CTkButton(
+            search_frame,
+            text="🗑️ Clear All",
+            font=ctk.CTkFont(size=11, weight="bold"),
+            fg_color="#1e293b",
+            hover_color="#ef4444",
+            text_color="#94a3b8",
+            width=90,
+            height=36,
+            corner_radius=8,
+            command=self._clear_all_history
+        )
+        btn_clear_all.grid(row=0, column=1)
 
         # Scrollable Feed Container
         self.feed_scroll = ctk.CTkScrollableFrame(
@@ -419,7 +436,27 @@ class JarvisDashboard:
 
         self._render_history_feed()
 
+    def _delete_history_item(self, target_item: Dict[str, Any]):
+        """Delete an individual interaction card and sync to disk."""
+        if target_item in self.history:
+            self.history.remove(target_item)
+            save_history(self.history)
+            filter_t = self.search_entry.get() if hasattr(self, "search_entry") else ""
+            self._render_history_feed(filter_text=filter_t)
+            if self.on_clear_history:
+                self.on_clear_history()
+
+    def _clear_all_history(self):
+        """Clears all conversation transcripts and memory context."""
+        self.history.clear()
+        save_history(self.history)
+        self._render_history_feed()
+        if self.on_clear_history:
+            self.on_clear_history()
+
     def _render_history_feed(self, filter_text: str = ""):
+        if not hasattr(self, "feed_scroll"):
+            return
         # Clear existing items
         for widget in self.feed_scroll.winfo_children():
             widget.destroy()
@@ -472,9 +509,24 @@ class JarvisDashboard:
         card.pack(fill="x", padx=10, pady=6)
         card.grid_columnconfigure(1, weight=1)
 
-        # Header Row: Time + Modality Badge + Tool Badge
+        # Header Row: Time + Modality Badge + Tool Badge + Delete Button
         top_row = ctk.CTkFrame(card, fg_color="transparent")
         top_row.pack(fill="x", padx=14, pady=(10, 6))
+
+        # Delete Button on card
+        btn_del = ctk.CTkButton(
+            top_row,
+            text="✕",
+            font=ctk.CTkFont(size=10, weight="bold"),
+            fg_color="transparent",
+            text_color="#64748b",
+            hover_color="#ef4444",
+            width=24,
+            height=20,
+            corner_radius=4,
+            command=lambda it=item: self._delete_history_item(it)
+        )
+        btn_del.pack(side="right")
 
         time_str = item.get("time", "")
         if not time_str:
@@ -651,6 +703,26 @@ class JarvisDashboard:
             command=self._handle_chat_send
         )
         self.chat_send_btn.grid(row=0, column=1)
+
+        self.chat_clear_btn = ctk.CTkButton(
+            input_bar,
+            text="Clear",
+            font=ctk.CTkFont(size=12, weight="bold"),
+            fg_color="#1e293b",
+            hover_color="#ef4444",
+            text_color="#94a3b8",
+            width=65,
+            height=40,
+            corner_radius=8,
+            command=self._clear_chat_view
+        )
+        self.chat_clear_btn.grid(row=0, column=2, padx=(8, 0))
+
+    def _clear_chat_view(self):
+        for w in self.chat_scroll.winfo_children():
+            w.destroy()
+        if self.on_clear_history:
+            self.on_clear_history()
 
     def _append_chat_message(self, role: str, text: str):
         if not text:
@@ -1017,11 +1089,11 @@ class JarvisDashboard:
         row1.pack(fill="x", padx=14, pady=(8, 2))
         ctk.CTkLabel(row1, text="Follow-Up Listening Window:", font=ctk.CTkFont(size=12, weight="bold"), text_color="#f8fafc").pack(side="left")
         
-        curr_timeout = float(self.config.get("follow_up_timeout", 0.0))
+        curr_timeout = float(self.config.get("follow_up_timeout", 8.0))
         curr_timeout_str = "Off" if curr_timeout <= 0.0 else f"{int(curr_timeout)}s"
         self.timeout_seg = ctk.CTkSegmentedButton(
             row1,
-            values=["Off", "5s", "10s", "15s", "20s"],
+            values=["Off", "5s", "8s", "10s", "15s", "20s"],
             command=self._on_timeout_change,
             selected_color="#2563eb",
             height=28
@@ -1354,8 +1426,14 @@ class JarvisDashboard:
     # WINDOW CONTROLS (SHOW / HIDE)
     # ==========================================
     def show(self):
-        """Brings the dashboard smoothly to the foreground."""
+        """Brings the dashboard smoothly to the foreground and refreshes history feed."""
         def _do_show():
+            try:
+                self.history = load_history()
+                if self.current_view == "home":
+                    self._render_history_feed()
+            except Exception:
+                pass
             self.root.deiconify()
             self.root.lift()
             self.root.attributes("-topmost", True)

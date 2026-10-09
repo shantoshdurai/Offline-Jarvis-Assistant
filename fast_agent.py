@@ -255,13 +255,13 @@ TOOL_DEFINITIONS = [
         "type": "function",
         "function": {
             "name": "system_control",
-            "description": "Control system volume or lock the screen (volume_up, volume_down, mute, lock).",
+            "description": "Control system volume, media playback (play_pause, next_track, previous_track), or lock the screen.",
             "parameters": {
                 "type": "object",
                 "properties": {
                     "action": {
                         "type": "string",
-                        "description": "Action: 'volume_up', 'volume_down', 'mute', 'lock'."
+                        "description": "Action: 'volume_up', 'volume_down', 'mute', 'lock', 'play_pause', 'next_track', 'previous_track'."
                     }
                 },
                 "required": ["action"]
@@ -440,6 +440,18 @@ def dispatch_tool_call(name: str, args: Dict[str, Any], agent_ref: Optional[Any]
             act = args.get("action", "")
             if act in ("volume_up", "volume_down", "mute"):
                 return tools.adjust_volume(act.replace("volume_", ""))
+            elif act in ("play_pause", "play", "pause", "resume", "media_play_pause"):
+                ctypes.windll.user32.keybd_event(0xB3, 0, 0, 0)
+                ctypes.windll.user32.keybd_event(0xB3, 0, 2, 0)
+                return "Playback toggled."
+            elif act in ("next_track", "next"):
+                ctypes.windll.user32.keybd_event(0xB0, 0, 0, 0)
+                ctypes.windll.user32.keybd_event(0xB0, 0, 2, 0)
+                return "Skipped to next track."
+            elif act in ("prev_track", "previous_track", "previous"):
+                ctypes.windll.user32.keybd_event(0xB1, 0, 0, 0)
+                ctypes.windll.user32.keybd_event(0xB1, 0, 2, 0)
+                return "Returned to previous track."
             elif act == "lock":
                 ctypes.windll.user32.LockWorkStation()
                 return "Locked Windows workstation."
@@ -554,7 +566,7 @@ class FastAgent:
 
         # Load persistent configuration
         self.config = load_config()
-        self.follow_up_timeout = float(self.config.get("follow_up_timeout", 0.0))
+        self.follow_up_timeout = float(self.config.get("follow_up_timeout", 8.0))
         self.silence_limit = float(self.config.get("silence_limit", 1.2))
         self.sfx_enabled = bool(self.config.get("sfx_enabled", True))
         self.voice_dismissal_enabled = bool(self.config.get("voice_dismissal_enabled", True))
@@ -572,6 +584,7 @@ class FastAgent:
             on_save_api_key=self.save_api_key,
             on_toggle_wake_word=self.set_wake_word_enabled,
             on_update_settings=self.on_update_settings,
+            on_clear_history=self.clear_history_context,
         )
 
         # 2. OpenWhispr Floating Voice Pill Overlay (attached to CTk root)
@@ -623,6 +636,19 @@ class FastAgent:
         self.history: List[Dict[str, Any]] = [
             {"role": "system", "content": SYSTEM_PROMPT}
         ]
+        # Seed recent conversation memory from history.json so agent remembers context across restarts
+        try:
+            saved_hist = load_history()
+            for h in saved_hist[-8:]:
+                u = h.get("user")
+                r = h.get("response")
+                if u and r:
+                    self.history.append({"role": "user", "content": u})
+                    self.history.append({"role": "assistant", "content": r})
+            if len(self.history) > 1:
+                print(f"[OK] Restored {len(self.history)-1} recent conversation turns from history into active memory")
+        except Exception:
+            pass
 
         # 8. SAPI Voice Fallback
         try:
@@ -685,9 +711,14 @@ class FastAgent:
             print(f"[Warning] OpenWakeWord error ({e}).")
             self.oww = None
 
+    def clear_history_context(self):
+        """Resets active LLM conversation memory."""
+        self.history = [{"role": "system", "content": SYSTEM_PROMPT}]
+        print("[Memory] Conversation history cleared from active memory context.")
+
     def on_update_settings(self, new_cfg: Dict[str, Any]):
         self.config.update(new_cfg)
-        self.follow_up_timeout = float(self.config.get("follow_up_timeout", 0.0))
+        self.follow_up_timeout = float(self.config.get("follow_up_timeout", 8.0))
         self.silence_limit = float(self.config.get("silence_limit", 1.2))
         self.sfx_enabled = bool(self.config.get("sfx_enabled", True))
         if self.pill:
@@ -932,6 +963,8 @@ class FastAgent:
         finally:
             self.is_recording_active = False
             self.manual_stop_recording.clear()
+            if self.pill:
+                self.pill.update_volume(0.0)
             if hasattr(self, "dashboard") and self.dashboard:
                 self.dashboard.set_recording_state(False)
 
@@ -1051,15 +1084,21 @@ class FastAgent:
                 break
 
         if self.is_dismissal_command(clean_text):
-            t_tts = self.tts_speak("Standing by.")
-            t_total = t_stt + t_tts
-            self.dashboard.add_interaction(
-                user_text=user_text,
-                response="Standing by.",
-                source=source,
-                tool="sleep",
-                latency={"total": round(t_total, 2), "stt": round(t_stt, 2), "llm": 0.0, "tool": 0.0, "tts": round(t_tts, 2)}
-            )
+            try:
+                t_tts = float(self.tts_speak("Standing by.") or 0.0)
+            except Exception:
+                t_tts = 0.0
+            t_total = float(t_stt) + t_tts
+            try:
+                self.dashboard.add_interaction(
+                    user_text=user_text,
+                    response="Standing by.",
+                    source=source,
+                    tool="sleep",
+                    latency={"total": round(t_total, 2), "stt": round(float(t_stt), 2), "llm": 0.0, "tool": 0.0, "tts": round(t_tts, 2)}
+                )
+            except Exception as e:
+                print(f"[Dashboard Update Error]: {e}")
             if self.is_session_active:
                 self.is_session_active = False
             return
@@ -1108,27 +1147,34 @@ class FastAgent:
         self.history.append({"role": "assistant", "content": spoken_response})
 
         # 3. TTS Speech Synthesis (pill state transitions to speaking when audio playback begins)
-        t_tts = self.tts_speak(cleaned_speech)
+        try:
+            t_tts = float(self.tts_speak(cleaned_speech) or 0.0)
+        except Exception as e:
+            print(f"[TTS Error]: {e}")
+            t_tts = 0.0
 
         # 4. Latency Aggregation & Reporting
-        t_total = t_stt + t_llm + t_tool + t_tts
+        t_total = float(t_stt) + float(t_llm) + float(t_tool) + float(t_tts)
         latency_info = {
             "total": round(t_total, 2),
-            "stt": round(t_stt, 2),
-            "llm": round(t_llm, 2),
-            "tool": round(t_tool, 2),
-            "tts": round(t_tts, 2)
+            "stt": round(float(t_stt), 2),
+            "llm": round(float(t_llm), 2),
+            "tool": round(float(t_tool), 2),
+            "tts": round(float(t_tts), 2)
         }
         print(f"⏱️ [Latency Benchmark] Total: {t_total:.2f}s | STT: {t_stt:.2f}s | LLM: {t_llm:.2f}s | Tool: {t_tool:.2f}s | TTS Gen: {t_tts:.2f}s")
 
         # Add interaction to Dashboard GUI feed
-        self.dashboard.add_interaction(
-            user_text=user_text,
-            response=spoken_response,
-            source=source,
-            tool=executed_tool_name,
-            latency=latency_info
-        )
+        try:
+            self.dashboard.add_interaction(
+                user_text=user_text,
+                response=spoken_response,
+                source=source,
+                tool=executed_tool_name,
+                latency=latency_info
+            )
+        except Exception as e:
+            print(f"[Dashboard Update Error]: {e}")
 
         if memory_affected:
             self.dashboard.refresh_memory_view()
@@ -1203,6 +1249,8 @@ class FastAgent:
                     self.pill.set_state("listening")
                 else:
                     self.pill.set_state("idle")
+
+        return tts_gen_time
 
     def is_dismissal_command(self, text: str) -> bool:
         """Detect natural voice sleep / dismissal commands for Jarvis itself.
@@ -1408,11 +1456,18 @@ class FastAgent:
             except queue.Empty:
                 continue
 
-            if isinstance(item, tuple) and item[0] == "WAKE_TRIGGER":
-                pre_roll = item[1]
-                self.handle_conversation_session(pre_roll_chunks=pre_roll)
-            elif item == "TRIGGER":
-                self.handle_conversation_session(pre_roll_chunks=None)
+            try:
+                if isinstance(item, tuple) and item[0] == "WAKE_TRIGGER":
+                    pre_roll = item[1]
+                    self.handle_conversation_session(pre_roll_chunks=pre_roll)
+                elif item == "TRIGGER":
+                    self.handle_conversation_session(pre_roll_chunks=None)
+            except Exception as e:
+                print(f"[Worker Error in conversation session]: {e}")
+                self.is_session_active = False
+                self.is_listening.clear()
+                if self.pill:
+                    self.pill.set_state("idle")
 
     def _terminal_input_loop(self):
         """Console keyboard input loop when --console is active."""

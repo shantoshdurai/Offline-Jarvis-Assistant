@@ -229,53 +229,51 @@ class FloatingVoicePill:
         self.canvas.delete("all")
         self.current_level += (self.target_level - self.current_level) * 0.35
 
-        if self.state == "recording":
-            # Expand to 110px pill with animated waveform
+        if self.state in ("recording", "listening"):
+            # Expand to 114px pill with live audio level detection
             w = self.w_rec
-            self._draw_pill_bg(w, self.h, fill="#16161a", outline="#2e2e38")
+            is_recording = (self.state == "recording")
+            outline_col = "#38bdf8" if is_recording else "#0284c7"
+            self._draw_pill_bg(w, self.h, fill="#16161a", outline=outline_col)
             self._draw_mic_icon(20, self.h / 2)
 
-            # Draw 8 animated waveform equalizer bars
-            num_bars = 8
             start_x = 42
-            bar_gap = 7
-            max_bar_h = 22
-            min_bar_h = 4
+            end_x = 102
             mid_y = self.h / 2
+            level = max(0.0, min(1.0, self.current_level))
 
-            t_ms = time.time() * 10
-            for i in range(num_bars):
-                bx = start_x + i * bar_gap
-                # Smooth sinusoidal variation driven by volume level
-                wave_factor = 0.5 + 0.5 * math.sin(t_ms + i * 0.8)
-                bar_h = min_bar_h + (max_bar_h - min_bar_h) * self.current_level * wave_factor
+            # OpenWhispr-style sound detection:
+            # If silent (< 0.05 level), show a clean flat linear line.
+            # If user speaks (>= 0.05 level), undulate smoothly into dynamic sound wave.
+            if level < 0.05:
+                line_color = "#94a3b8" if is_recording else "#64748b"
                 self.canvas.create_line(
-                    bx, mid_y - bar_h / 2,
-                    bx, mid_y + bar_h / 2,
-                    fill="#f4f4f5",
-                    width=2.5,
+                    start_x, mid_y, end_x, mid_y,
+                    fill=line_color,
+                    width=2.0,
                     capstyle="round"
                 )
+            else:
+                num_points = 25
+                coords = []
+                t_time = time.time() * (14 if is_recording else 10)
+                wave_color = "#38bdf8" if is_recording else "#00e5ff"
+                max_amp = (self.h * 0.38)
+                for j in range(num_points):
+                    ratio = j / (num_points - 1)
+                    px = start_x + ratio * (end_x - start_x)
+                    # Bell envelope so wave smoothly attaches to the horizontal line tips
+                    envelope = math.sin(ratio * math.pi)
+                    w1 = math.sin(t_time + ratio * 3.5 * math.pi)
+                    w2 = 0.35 * math.sin(t_time * 1.8 + ratio * 7.0 * math.pi)
+                    py = mid_y + (max_amp * level * envelope) * (w1 + w2)
+                    coords.extend([px, py])
 
-        elif self.state == "listening":
-            # 110px pill showing gentle breathing wave bars (attentive follow-up mode)
-            w = self.w_rec
-            self._draw_pill_bg(w, self.h, fill="#16161a", outline="#0284c7")
-            self._draw_mic_icon(20, self.h / 2)
-
-            num_bars = 6
-            start_x = 44
-            bar_gap = 9
-            mid_y = self.h / 2
-            t_ms = time.time() * 4
-            for i in range(num_bars):
-                bx = start_x + i * bar_gap
-                pulse = 3 + 5 * (0.5 + 0.5 * math.sin(t_ms - i * 0.6))
                 self.canvas.create_line(
-                    bx, mid_y - pulse,
-                    bx, mid_y + pulse,
-                    fill="#38bdf8",
-                    width=2,
+                    coords,
+                    smooth=True,
+                    fill=wave_color,
+                    width=2.5,
                     capstyle="round"
                 )
 
